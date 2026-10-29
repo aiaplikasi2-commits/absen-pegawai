@@ -1,5 +1,8 @@
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import { cosineSimilarity } from '../utils/geoAndTime';
+import { installWasmConsoleFilter } from '../utils/wasmConsoleFilter';
+
+installWasmConsoleFilter();
 
 let landmarkerInstance: FaceLandmarker | null = null;
 let loadingPromise: Promise<FaceLandmarker> | null = null;
@@ -9,43 +12,46 @@ let loadingPromise: Promise<FaceLandmarker> | null = null;
  * Assets are cached by Workbox Service Worker after initial load for offline verification.
  */
 export async function getFaceLandmarker(): Promise<FaceLandmarker> {
+  installWasmConsoleFilter();
   if (landmarkerInstance) return landmarkerInstance;
   if (loadingPromise) return loadingPromise;
 
   loadingPromise = (async () => {
     try {
+      installWasmConsoleFilter();
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
       );
-      const landmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-          delegate: 'GPU',
-        },
-        outputFaceBlendshapes: true,
-        runningMode: 'VIDEO',
-        numFaces: 2, // Detect >1 face to reject multiple people in frame
-      });
-      landmarkerInstance = landmarker;
-      return landmarker;
-    } catch (gpuError) {
-      // Fallback to CPU delegate if WebGL/GPU delegate is unavailable on device
-      const vision = await FilesetResolver.forVisionTasks(
-        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
-      );
-      const landmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-          delegate: 'CPU',
-        },
-        outputFaceBlendshapes: true,
-        runningMode: 'VIDEO',
-        numFaces: 2,
-      });
-      landmarkerInstance = landmarker;
-      return landmarker;
+      installWasmConsoleFilter();
+      try {
+        const landmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'GPU',
+          },
+          outputFaceBlendshapes: true,
+          runningMode: 'VIDEO',
+          numFaces: 2, // Detect >1 face to reject multiple people in frame
+        });
+        landmarkerInstance = landmarker;
+        return landmarker;
+      } catch {
+        installWasmConsoleFilter();
+        // Fallback to CPU delegate if WebGL/GPU delegate is unavailable on device
+        const landmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+            delegate: 'CPU',
+          },
+          outputFaceBlendshapes: true,
+          runningMode: 'VIDEO',
+          numFaces: 2,
+        });
+        landmarkerInstance = landmarker;
+        return landmarker;
+      }
     } finally {
       loadingPromise = null;
     }

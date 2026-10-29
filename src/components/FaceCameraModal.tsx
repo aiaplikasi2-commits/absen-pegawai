@@ -109,6 +109,7 @@ export const FaceCameraModal: React.FC<FaceCameraModalProps> = ({
       updateStage('ALIGN_FACE');
 
       let lastVideoTime = -1;
+      let lastTimestampMs = 0;
       const processFrame = () => {
         const video = videoRef.current;
         const canvas = scratchCanvasRef.current;
@@ -116,7 +117,9 @@ export const FaceCameraModal: React.FC<FaceCameraModalProps> = ({
 
         if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
           lastVideoTime = video.currentTime;
-          const nowMs = performance.now();
+          const rawNowMs = Math.floor(performance.now());
+          const nowMs = rawNowMs > lastTimestampMs ? rawNowMs : lastTimestampMs + 1;
+          lastTimestampMs = nowMs;
           const lighting = analyzeVideoLightingAndTexture(video, canvas);
           const detection = landmarker.detectForVideo(video, nowMs);
           const q = evaluateFaceFrame(

@@ -26,7 +26,11 @@ import type {
 const PORT = 3000;
 const JWT_SECRET =
   process.env.JWT_SECRET || 'absensi-wajah-gps-jwt-secret-key-2026-secure';
-const DEFAULT_ADMIN_USERNAME = process.env.DEFAULT_ADMIN_USERNAME || 'admin';
+const RAW_ENV_ADMIN_USERNAME = String(process.env.DEFAULT_ADMIN_USERNAME || '').trim();
+const NORMALIZED_ENV_ADMIN_USERNAME = RAW_ENV_ADMIN_USERNAME.toLowerCase();
+const DEFAULT_ADMIN_USERNAME = /^[a-z0-9_.\-]{3,64}$/.test(NORMALIZED_ENV_ADMIN_USERNAME)
+  ? NORMALIZED_ENV_ADMIN_USERNAME
+  : 'admin';
 const DEFAULT_ADMIN_PASSWORD =
   process.env.DEFAULT_ADMIN_PASSWORD || 'Admin123!';
 const BOOTSTRAP_ADMIN_EMAIL = 'mull.jhamur@gmail.com';
@@ -62,40 +66,68 @@ const DEFAULT_OFFICE_SETTINGS: OfficeSettings = {
 };
 
 let initializedBootstrap = false;
+let bootstrapPromise: Promise<void> | null = null;
 
-async function ensureBootstrapData() {
+async function ensureBootstrapData(): Promise<void> {
   if (initializedBootstrap) return;
-  try {
-    // 1. Ensure office_settings/main exists
-    const settingsRef = adminDb.collection('office_settings').doc('main');
-    const settingsSnap = await settingsRef.get();
-    if (!settingsSnap.exists) {
-      await settingsRef.set(DEFAULT_OFFICE_SETTINGS);
-    }
+  if (bootstrapPromise) return bootstrapPromise;
 
-    // 2. Ensure default admin username/password account exists
-    const adminUserRef = adminDb.collection('users').doc(DEFAULT_ADMIN_USERNAME);
-    const adminSnap = await adminUserRef.get();
-    if (!adminSnap.exists) {
-      const passwordHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 10);
-      await adminUserRef.set({
-        username: DEFAULT_ADMIN_USERNAME,
-        passwordHash,
-        role: 'ADMIN',
-        employeeId: 'ADM-001',
-        fullName: 'Administrator Utama',
-        position: 'HR & Operations Admin',
-        failedAttempts: 0,
-        lockedUntilMs: 0,
-        isActive: true,
-        createdAtIso: new Date().toISOString(),
-      });
-    }
+  bootstrapPromise = (async () => {
+    try {
+      // 1. Ensure office_settings/main exists atomically without overwriting existing settings
+      const settingsRef = adminDb.collection('office_settings').doc('main');
+      const settingsSnap = await settingsRef.get();
+      if (!settingsSnap.exists) {
+        await settingsRef.createIfAbsent({
+          ...DEFAULT_OFFICE_SETTINGS,
+          updatedAtIso: new Date().toISOString(),
+        });
+      }
 
-    initializedBootstrap = true;
-  } catch (err) {
-    console.error('Bootstrap initialization warning:', err);
-  }
+      // 2. Ensure default admin username/password account exists (normalized lowercase)
+      const adminCandidates = Array.from(new Set(['admin', DEFAULT_ADMIN_USERNAME]));
+      for (const candidateUsername of adminCandidates) {
+        const adminUserRef = adminDb.collection('users').doc(candidateUsername);
+        const adminSnap = await adminUserRef.get();
+        if (!adminSnap.exists) {
+          const passwordHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 10);
+          await adminUserRef.createIfAbsent({
+            username: candidateUsername,
+            passwordHash,
+            role: 'ADMIN',
+            employeeId: 'ADM-001',
+            fullName: 'Administrator Utama',
+            position: 'HR & Operations Admin',
+            failedAttempts: 0,
+            lockedUntilMs: 0,
+            isActive: true,
+            createdAtIso: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Clean up legacy mixed-case admin document if env var had uppercase characters
+      if (
+        RAW_ENV_ADMIN_USERNAME &&
+        RAW_ENV_ADMIN_USERNAME !== DEFAULT_ADMIN_USERNAME &&
+        /^[a-zA-Z0-9_.\-]{1,128}$/.test(RAW_ENV_ADMIN_USERNAME)
+      ) {
+        const legacyRef = adminDb.collection('users').doc(RAW_ENV_ADMIN_USERNAME);
+        const legacySnap = await legacyRef.get();
+        if (legacySnap.exists && legacySnap.data()?.role === 'ADMIN') {
+          await legacyRef.delete();
+        }
+      }
+
+      initializedBootstrap = true;
+    } catch (err) {
+      console.error('Bootstrap initialization warning:', err);
+    } finally {
+      bootstrapPromise = null;
+    }
+  })();
+
+  return bootstrapPromise;
 }
 
 async function writeAuditLog(entry: Omit<AuditLogRecord, 'logId' | 'timestampIso'>) {
@@ -503,13 +535,16 @@ export function createApiApp(): express.Express {
         return;
       }
       const nowIso = new Date().toISOString();
-      await adminDb.collection('employees').doc(s.employeeId).set(
-        {
-          consentAccepted: true,
-          consentTimestampIso: nowIso,
-        },
-        { merge: true }
-      );
+      const empRef = adminDb.collection('employees').doc(s.employeeId);
+      const empSnap = await empRef.get();
+      if (!empSnap.exists) {
+        res.status(404).json({ error: 'Profil karyawan tidak ditemukan.' });
+        return;
+      }
+      await empRef.update({
+        consentAccepted: true,
+        consentTimestampIso: nowIso,
+      });
       await writeAuditLog({
         actorUsername: s.username,
         actorRole: s.role,
@@ -1948,11 +1983,11 @@ export function createApiApp(): express.Express {
         let restoredCount = 0;
         for (const rec of payload.attendanceRecords) {
           if (rec && typeof rec.transactionId === 'string') {
-            await adminDb
+            const created = await adminDb
               .collection('attendance_records')
               .doc(rec.transactionId)
-              .set(rec, { merge: true });
-            restoredCount++;
+              .createIfAbsent(rec);
+            if (created) restoredCount++;
           }
         }
         if (Array.isArray(payload.attendanceAppeals)) {
@@ -1961,7 +1996,7 @@ export function createApiApp(): express.Express {
               await adminDb
                 .collection('attendance_appeals')
                 .doc(apl.appealId)
-                .set(apl, { merge: true });
+                .createIfAbsent(apl);
             }
           }
         }
@@ -1971,7 +2006,7 @@ export function createApiApp(): express.Express {
               await adminDb
                 .collection('employees')
                 .doc(emp.employeeId)
-                .set(emp, { merge: true });
+                .createIfAbsent(emp);
             }
           }
         }

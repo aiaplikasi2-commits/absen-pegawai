@@ -13,6 +13,7 @@ import {
   query,
   where,
   writeBatch,
+  runTransaction,
 } from 'firebase/firestore';
 import crypto from 'crypto';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -40,6 +41,54 @@ const SERVER_VAULT_KEY = crypto
   .update(VAULT_SEED)
   .digest('hex'); // 64 lowercase hex chars matching `isValidSecretKey` in firestore.rules
 
+export enum ServerOperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface ServerFirestoreErrorInfo {
+  error: string;
+  operationType: ServerOperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+function handleServerFirestoreError(
+  error: unknown,
+  operationType: ServerOperationType,
+  sanitizedPath: string | null
+): never {
+  const errInfo: ServerFirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    operationType,
+    path: sanitizedPath,
+    authInfo: {
+      userId: 'server-vault',
+      email: null,
+      emailVerified: null,
+      isAnonymous: false,
+      tenantId: null,
+      providerInfo: [],
+    },
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 function vaultDocRef(colName: string, docId: string) {
   return doc(rawDb, 'server_vault', SERVER_VAULT_KEY, colName, docId);
 }
@@ -51,29 +100,79 @@ function vaultColRef(colName: string) {
 class DocWrapper {
   constructor(private colName: string, public id: string) {}
 
+  private sanitizedPath() {
+    return `${this.colName}/${this.id}`;
+  }
+
   async get() {
-    const snap = await getDoc(vaultDocRef(this.colName, this.id));
-    return {
-      id: snap.id,
-      exists: snap.exists(),
-      data: () => snap.data(),
-    };
+    try {
+      const snap = await getDoc(vaultDocRef(this.colName, this.id));
+      return {
+        id: snap.id,
+        exists: snap.exists(),
+        data: () => snap.data(),
+      };
+    } catch (error) {
+      handleServerFirestoreError(error, ServerOperationType.GET, this.sanitizedPath());
+    }
+  }
+
+  /**
+   * Atomically creates the document ONLY if it does not already exist.
+   * Prevents concurrent requests or multi-instance cold starts from racing and
+   * triggering an unauthorized `update` on immutable fields (`createdAtIso`).
+   */
+  async createIfAbsent(data: Record<string, any>): Promise<boolean> {
+    const ref = vaultDocRef(this.colName, this.id);
+    try {
+      return await runTransaction(rawDb, async (tx) => {
+        const snap = await tx.get(ref);
+        if (snap.exists()) {
+          return false;
+        }
+        tx.set(ref, data);
+        return true;
+      });
+    } catch (error) {
+      // If another concurrent transaction created the document simultaneously, confirm existence
+      try {
+        const check = await getDoc(ref);
+        if (check.exists()) {
+          return false;
+        }
+      } catch {
+        // fall through to structured error
+      }
+      handleServerFirestoreError(error, ServerOperationType.CREATE, this.sanitizedPath());
+    }
   }
 
   async set(data: Record<string, any>, options?: { merge?: boolean }) {
-    if (options?.merge) {
-      await setDoc(vaultDocRef(this.colName, this.id), data, { merge: true });
-    } else {
-      await setDoc(vaultDocRef(this.colName, this.id), data);
+    try {
+      if (options?.merge) {
+        await setDoc(vaultDocRef(this.colName, this.id), data, { merge: true });
+      } else {
+        await setDoc(vaultDocRef(this.colName, this.id), data);
+      }
+    } catch (error) {
+      handleServerFirestoreError(error, ServerOperationType.WRITE, this.sanitizedPath());
     }
   }
 
   async update(updates: Record<string, any>) {
-    await updateDoc(vaultDocRef(this.colName, this.id), updates);
+    try {
+      await updateDoc(vaultDocRef(this.colName, this.id), updates);
+    } catch (error) {
+      handleServerFirestoreError(error, ServerOperationType.UPDATE, this.sanitizedPath());
+    }
   }
 
   async delete() {
-    await deleteDoc(vaultDocRef(this.colName, this.id));
+    try {
+      await deleteDoc(vaultDocRef(this.colName, this.id));
+    } catch (error) {
+      handleServerFirestoreError(error, ServerOperationType.DELETE, this.sanitizedPath());
+    }
   }
 
   rawRef() {
@@ -92,25 +191,29 @@ class QueryWrapper {
   }
 
   async get() {
-    const col = vaultColRef(this.colName);
-    const q =
-      this.filters.length > 0
-        ? query(
-            col,
-            ...this.filters.map((f) => where(f.field, f.op, f.val))
-          )
-        : col;
-    const snap = await getDocs(q);
-    const docs = snap.docs.map((d) => ({
-      id: d.id,
-      exists: true,
-      data: () => d.data(),
-    }));
-    return {
-      docs,
-      forEach: (cb: (d: { id: string; data: () => any }) => void) =>
-        docs.forEach(cb),
-    };
+    try {
+      const col = vaultColRef(this.colName);
+      const q =
+        this.filters.length > 0
+          ? query(
+              col,
+              ...this.filters.map((f) => where(f.field, f.op, f.val))
+            )
+          : col;
+      const snap = await getDocs(q);
+      const docs = snap.docs.map((d) => ({
+        id: d.id,
+        exists: true,
+        data: () => d.data(),
+      }));
+      return {
+        docs,
+        forEach: (cb: (d: { id: string; data: () => any }) => void) =>
+          docs.forEach(cb),
+      };
+    } catch (error) {
+      handleServerFirestoreError(error, ServerOperationType.LIST, this.colName);
+    }
   }
 }
 
@@ -130,12 +233,22 @@ export const adminDb = {
   },
   batch() {
     const b = writeBatch(rawDb);
+    const paths: string[] = [];
     return {
       set(docWrapper: DocWrapper, data: Record<string, any>) {
+        paths.push(`${docWrapper.id}`);
         b.set(docWrapper.rawRef(), data);
       },
-      commit() {
-        return b.commit();
+      async commit() {
+        try {
+          await b.commit();
+        } catch (error) {
+          handleServerFirestoreError(
+            error,
+            ServerOperationType.WRITE,
+            paths.join(',') || 'batch'
+          );
+        }
       },
     };
   },

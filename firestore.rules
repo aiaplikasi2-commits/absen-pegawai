@@ -1,0 +1,377 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\.\\-]+$');
+    }
+
+    function isValidSecretKey(key) {
+      return key is string && key.size() == 64 && key.matches('^[a-f0-9]{64}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && request.auth.token.email == 'mull.jhamur@gmail.com';
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isBootstrappedAdmin() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidUserAccount(data) {
+      return data.keys().hasAll([
+        'username', 'passwordHash', 'role', 'employeeId',
+        'failedAttempts', 'lockedUntilMs', 'isActive', 'createdAtIso'
+      ]) &&
+      data.keys().hasOnly([
+        'username', 'passwordHash', 'role', 'employeeId', 'fullName', 'position',
+        'failedAttempts', 'lockedUntilMs', 'isActive', 'createdAtIso'
+      ]) &&
+      data.username is string && data.username.size() >= 3 && data.username.size() <= 64 &&
+      data.passwordHash is string && data.passwordHash.size() >= 20 && data.passwordHash.size() <= 256 &&
+      (data.role == 'ADMIN' || data.role == 'EMPLOYEE') &&
+      data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 64 &&
+      data.failedAttempts is number && data.failedAttempts >= 0 && data.failedAttempts <= 1000 &&
+      data.lockedUntilMs is number && data.lockedUntilMs >= 0 &&
+      data.isActive is bool &&
+      data.createdAtIso is string && data.createdAtIso.size() <= 40 &&
+      (!('fullName' in data) || (data.fullName is string && data.fullName.size() <= 120)) &&
+      (!('position' in data) || (data.position is string && data.position.size() <= 80));
+    }
+
+    function isValidEmployee(data) {
+      return data.keys().hasAll([
+        'employeeId', 'fullName', 'username', 'position',
+        'hasFaceProfile', 'consentAccepted', 'isActive', 'createdAtIso'
+      ]) &&
+      data.keys().hasOnly([
+        'employeeId', 'fullName', 'username', 'position',
+        'hasFaceProfile', 'consentAccepted', 'consentTimestampIso',
+        'isActive', 'firebaseUid', 'createdAtIso'
+      ]) &&
+      data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 64 &&
+      data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 120 &&
+      data.username is string && data.username.size() >= 3 && data.username.size() <= 64 &&
+      data.position is string && data.position.size() <= 80 &&
+      data.hasFaceProfile is bool &&
+      data.consentAccepted is bool &&
+      data.isActive is bool &&
+      data.createdAtIso is string && data.createdAtIso.size() <= 40 &&
+      (!('consentTimestampIso' in data) || (data.consentTimestampIso is string && data.consentTimestampIso.size() <= 40)) &&
+      (!('firebaseUid' in data) || (data.firebaseUid is string && data.firebaseUid.size() <= 128));
+    }
+
+    function isValidFaceProfile(data) {
+      return data.keys().hasAll([
+        'employeeId', 'descriptorVector', 'sampleCount',
+        'qualityScore', 'encryptionVersion', 'updatedAtIso', 'registeredBy'
+      ]) &&
+      data.keys().hasOnly([
+        'employeeId', 'descriptorVector', 'sampleCount',
+        'qualityScore', 'encryptionVersion', 'updatedAtIso', 'registeredBy'
+      ]) &&
+      data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 64 &&
+      data.descriptorVector is list && data.descriptorVector.size() == 128 && data.descriptorVector[0] is number &&
+      data.sampleCount is number && data.sampleCount >= 1 && data.sampleCount <= 20 &&
+      data.qualityScore is number && data.qualityScore >= 0 && data.qualityScore <= 100 &&
+      data.encryptionVersion is string && data.encryptionVersion.size() <= 32 &&
+      data.updatedAtIso is string && data.updatedAtIso.size() <= 40 &&
+      data.registeredBy is string && data.registeredBy.size() <= 80;
+    }
+
+    function isValidOfficeSettings(data) {
+      return data.keys().hasAll([
+        'officeName', 'latitude', 'longitude', 'radiusMeters', 'maxGpsAccuracyMeters',
+        'workStartTime', 'workEndTime', 'lateToleranceMinutes', 'faceMatchThreshold',
+        'enableNightShift', 'adminReportEmail', 'autoMonthlyReportEnabled',
+        'dataRetentionDays', 'updatedAtIso'
+      ]) &&
+      data.keys().hasOnly([
+        'officeName', 'latitude', 'longitude', 'radiusMeters', 'maxGpsAccuracyMeters',
+        'workStartTime', 'workEndTime', 'lateToleranceMinutes', 'faceMatchThreshold',
+        'enableNightShift', 'adminReportEmail', 'autoMonthlyReportEnabled',
+        'lastMonthlyReportPeriod', 'dataRetentionDays', 'updatedAtIso'
+      ]) &&
+      data.officeName is string && data.officeName.size() >= 2 && data.officeName.size() <= 120 &&
+      data.latitude is number && data.latitude >= -90 && data.latitude <= 90 &&
+      data.longitude is number && data.longitude >= -180 && data.longitude <= 180 &&
+      data.radiusMeters is number && data.radiusMeters >= 10 && data.radiusMeters <= 5000 &&
+      data.maxGpsAccuracyMeters is number && data.maxGpsAccuracyMeters >= 5 && data.maxGpsAccuracyMeters <= 500 &&
+      data.workStartTime is string && data.workStartTime.size() == 5 &&
+      data.workEndTime is string && data.workEndTime.size() == 5 &&
+      data.lateToleranceMinutes is number && data.lateToleranceMinutes >= 0 && data.lateToleranceMinutes <= 240 &&
+      data.faceMatchThreshold is number && data.faceMatchThreshold >= 0.4 && data.faceMatchThreshold <= 0.99 &&
+      data.enableNightShift is bool &&
+      data.adminReportEmail is string && data.adminReportEmail.size() <= 160 &&
+      data.autoMonthlyReportEnabled is bool &&
+      data.dataRetentionDays is number && data.dataRetentionDays >= 7 && data.dataRetentionDays <= 3650 &&
+      data.updatedAtIso is string && data.updatedAtIso.size() <= 40 &&
+      (!('lastMonthlyReportPeriod' in data) || (data.lastMonthlyReportPeriod is string && data.lastMonthlyReportPeriod.size() <= 16));
+    }
+
+    function isValidAttendanceRecord(data) {
+      return data.keys().hasAll([
+        'transactionId', 'employeeId', 'employeeName', 'type', 'workDateWib',
+        'serverTimestampIso', 'deviceTimestampIso', 'gpsTimestampIso',
+        'latitude', 'longitude', 'gpsAccuracyMeters', 'distanceToOfficeMeters',
+        'geofenceValid', 'suspiciousLocationFlags', 'faceMatchScore',
+        'faceVerified', 'livenessVerified', 'livenessDetail',
+        'attendanceStatus', 'syncStatus', 'wasCapturedOffline'
+      ]) &&
+      data.keys().hasOnly([
+        'transactionId', 'employeeId', 'employeeName', 'type', 'workDateWib',
+        'serverTimestampIso', 'deviceTimestampIso', 'gpsTimestampIso',
+        'latitude', 'longitude', 'gpsAccuracyMeters', 'distanceToOfficeMeters',
+        'geofenceValid', 'suspiciousLocationFlags', 'faceMatchScore',
+        'faceVerified', 'livenessVerified', 'livenessDetail',
+        'attendanceStatus', 'syncStatus', 'wasCapturedOffline',
+        'clockSkewSeconds', 'rejectionReason', 'reviewedBy', 'reviewNote',
+        'reviewedAtIso', 'hasEvidence'
+      ]) &&
+      data.transactionId is string && data.transactionId.size() <= 100 &&
+      data.employeeId is string && data.employeeId.size() <= 64 &&
+      data.employeeName is string && data.employeeName.size() <= 120 &&
+      (data.type == 'CHECK_IN' || data.type == 'CHECK_OUT') &&
+      data.workDateWib is string && data.workDateWib.size() == 10 &&
+      data.serverTimestampIso is string && data.serverTimestampIso.size() <= 40 &&
+      data.deviceTimestampIso is string && data.deviceTimestampIso.size() <= 40 &&
+      data.gpsTimestampIso is string && data.gpsTimestampIso.size() <= 40 &&
+      data.latitude is number && data.longitude is number &&
+      data.gpsAccuracyMeters is number && data.distanceToOfficeMeters is number &&
+      data.geofenceValid is bool &&
+      data.suspiciousLocationFlags is list && data.suspiciousLocationFlags.size() <= 10 &&
+      (data.suspiciousLocationFlags.size() == 0 || (data.suspiciousLocationFlags[0] is string && data.suspiciousLocationFlags[0].size() <= 160)) &&
+      data.faceMatchScore is number &&
+      data.faceVerified is bool &&
+      data.livenessVerified is bool &&
+      data.livenessDetail is string && data.livenessDetail.size() <= 200 &&
+      data.attendanceStatus is string && data.attendanceStatus.size() <= 32 &&
+      data.syncStatus is string && data.syncStatus.size() <= 32 &&
+      data.wasCapturedOffline is bool &&
+      (!('clockSkewSeconds' in data) || data.clockSkewSeconds is number) &&
+      (!('rejectionReason' in data) || (data.rejectionReason is string && data.rejectionReason.size() <= 300)) &&
+      (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 80)) &&
+      (!('reviewNote' in data) || (data.reviewNote is string && data.reviewNote.size() <= 300)) &&
+      (!('reviewedAtIso' in data) || (data.reviewedAtIso is string && data.reviewedAtIso.size() <= 40)) &&
+      (!('hasEvidence' in data) || data.hasEvidence is bool);
+    }
+
+    function isValidAttendanceAppeal(data) {
+      return data.keys().hasAll([
+        'appealId', 'employeeId', 'employeeName', 'workDateWib',
+        'scope', 'category', 'reason', 'status', 'createdAtIso'
+      ]) &&
+      data.keys().hasOnly([
+        'appealId', 'employeeId', 'employeeName', 'workDateWib',
+        'scope', 'category', 'reason', 'latitude', 'longitude',
+        'status', 'createdAtIso', 'reviewedBy', 'reviewNote', 'reviewedAtIso'
+      ]) &&
+      data.appealId is string && data.appealId.size() >= 4 && data.appealId.size() <= 100 &&
+      data.employeeId is string && data.employeeId.size() >= 2 && data.employeeId.size() <= 64 &&
+      data.employeeName is string && data.employeeName.size() >= 2 && data.employeeName.size() <= 120 &&
+      data.workDateWib is string && data.workDateWib.size() == 10 &&
+      (data.scope == 'FULL_DAY' || data.scope == 'CHECK_IN' || data.scope == 'CHECK_OUT') &&
+      data.category is string && data.category.size() >= 2 && data.category.size() <= 80 &&
+      data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 500 &&
+      (data.status == 'PENDING' || data.status == 'APPROVED' || data.status == 'REJECTED') &&
+      data.createdAtIso is string && data.createdAtIso.size() <= 40 &&
+      (!('latitude' in data) || (data.latitude is number && data.latitude >= -90 && data.latitude <= 90)) &&
+      (!('longitude' in data) || (data.longitude is number && data.longitude >= -180 && data.longitude <= 180)) &&
+      (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 80)) &&
+      (!('reviewNote' in data) || (data.reviewNote is string && data.reviewNote.size() <= 300)) &&
+      (!('reviewedAtIso' in data) || (data.reviewedAtIso is string && data.reviewedAtIso.size() <= 40));
+    }
+
+    function isValidEvidence(data) {
+      return data.keys().hasAll([
+        'transactionId', 'employeeId', 'thumbnailDataUrl',
+        'expiresAtIso', 'purpose', 'createdAtIso'
+      ]) &&
+      data.keys().hasOnly([
+        'transactionId', 'employeeId', 'thumbnailDataUrl',
+        'expiresAtIso', 'purpose', 'createdAtIso'
+      ]) &&
+      data.transactionId is string && data.transactionId.size() <= 100 &&
+      data.employeeId is string && data.employeeId.size() <= 64 &&
+      data.thumbnailDataUrl is string && data.thumbnailDataUrl.size() <= 65000 &&
+      data.expiresAtIso is string && data.expiresAtIso.size() <= 40 &&
+      data.purpose is string && data.purpose.size() <= 120 &&
+      data.createdAtIso is string && data.createdAtIso.size() <= 40;
+    }
+
+    function isValidSyncEvent(data) {
+      return data.keys().hasAll([
+        'eventId', 'transactionId', 'employeeId',
+        'attemptTimestampIso', 'outcome', 'detail'
+      ]) &&
+      data.keys().hasOnly([
+        'eventId', 'transactionId', 'employeeId',
+        'attemptTimestampIso', 'outcome', 'detail'
+      ]) &&
+      data.eventId is string && data.eventId.size() <= 100 &&
+      data.transactionId is string && data.transactionId.size() <= 100 &&
+      data.employeeId is string && data.employeeId.size() <= 64 &&
+      data.attemptTimestampIso is string && data.attemptTimestampIso.size() <= 40 &&
+      data.outcome is string && data.outcome.size() <= 64 &&
+      data.detail is string && data.detail.size() <= 300;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll([
+        'logId', 'actorUsername', 'actorRole',
+        'action', 'targetId', 'reason', 'timestampIso'
+      ]) &&
+      data.keys().hasOnly([
+        'logId', 'actorUsername', 'actorRole', 'action', 'targetId',
+        'previousValueSummary', 'newValueSummary', 'reason', 'timestampIso'
+      ]) &&
+      data.logId is string && data.logId.size() <= 100 &&
+      data.actorUsername is string && data.actorUsername.size() <= 80 &&
+      data.actorRole is string && data.actorRole.size() <= 32 &&
+      data.action is string && data.action.size() <= 80 &&
+      data.targetId is string && data.targetId.size() <= 100 &&
+      data.reason is string && data.reason.size() <= 300 &&
+      data.timestampIso is string && data.timestampIso.size() <= 40 &&
+      (!('previousValueSummary' in data) || (data.previousValueSummary is string && data.previousValueSummary.size() <= 500)) &&
+      (!('newValueSummary' in data) || (data.newValueSummary is string && data.newValueSummary.size() <= 500));
+    }
+
+    // Connectivity probe
+    match /test/{docId} {
+      allow get: if isValidId(docId);
+      allow list, create, update, delete: if false;
+    }
+
+    // Public read-only / Admins marker
+    match /admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && (request.auth.uid == adminUid || isAdmin());
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // Cryptographically secret-isolated backend namespace
+    match /server_vault/{serverSecret} {
+      allow read, write: if false;
+
+      match /users/{username} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(username);
+        allow list: if false;
+        allow create: if isValidSecretKey(serverSecret) && isValidId(username) && isValidUserAccount(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(username) && isValidUserAccount(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'passwordHash', 'failedAttempts', 'lockedUntilMs', 'isActive', 'fullName', 'position'
+          ])
+        );
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(username);
+      }
+
+      match /employees/{employeeId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(employeeId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(employeeId) && isValidEmployee(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(employeeId) && isValidEmployee(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'fullName', 'position', 'hasFaceProfile', 'consentAccepted', 'consentTimestampIso', 'isActive'
+          ])
+        );
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(employeeId);
+      }
+
+      match /face_profiles/{employeeId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(employeeId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(employeeId) && isValidFaceProfile(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(employeeId) && isValidFaceProfile(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'descriptorVector', 'sampleCount', 'qualityScore', 'encryptionVersion', 'updatedAtIso', 'registeredBy'
+          ])
+        );
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(employeeId);
+      }
+
+      match /office_settings/{settingId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(settingId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(settingId) && isValidOfficeSettings(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(settingId) && isValidOfficeSettings(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'officeName', 'latitude', 'longitude', 'radiusMeters', 'maxGpsAccuracyMeters',
+            'workStartTime', 'workEndTime', 'lateToleranceMinutes', 'faceMatchThreshold',
+            'enableNightShift', 'adminReportEmail', 'autoMonthlyReportEnabled',
+            'lastMonthlyReportPeriod', 'dataRetentionDays', 'updatedAtIso'
+          ])
+        );
+        allow delete: if false;
+      }
+
+      match /attendance_records/{transactionId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(transactionId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(transactionId) && isValidAttendanceRecord(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(transactionId) && isValidAttendanceRecord(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'attendanceStatus', 'syncStatus', 'geofenceValid', 'faceVerified', 'livenessVerified',
+            'livenessDetail', 'reviewedBy', 'reviewNote', 'reviewedAtIso', 'rejectionReason', 'serverTimestampIso'
+          ])
+        );
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(transactionId);
+      }
+
+      match /attendance_appeals/{appealId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(appealId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(appealId) && isValidAttendanceAppeal(incoming());
+        allow update: if isValidSecretKey(serverSecret) && isValidId(appealId) && isValidAttendanceAppeal(incoming()) && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'status', 'reviewedBy', 'reviewNote', 'reviewedAtIso'
+          ])
+        );
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(appealId);
+      }
+
+      match /attendance_evidence/{transactionId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(transactionId);
+        allow list: if false;
+        allow create: if isValidSecretKey(serverSecret) && isValidId(transactionId) && isValidEvidence(incoming());
+        allow update: if false;
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(transactionId);
+      }
+
+      match /sync_events/{eventId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(eventId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(eventId) && isValidSyncEvent(incoming());
+        allow update: if false;
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(eventId);
+      }
+
+      match /audit_logs/{logId} {
+        allow get: if isValidSecretKey(serverSecret) && isValidId(logId);
+        allow list: if isValidSecretKey(serverSecret);
+        allow create: if isValidSecretKey(serverSecret) && isValidId(logId) && isValidAuditLog(incoming());
+        allow update: if false;
+        allow delete: if isValidSecretKey(serverSecret) && isValidId(logId);
+      }
+    }
+  }
+}

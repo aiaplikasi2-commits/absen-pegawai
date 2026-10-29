@@ -1,0 +1,6 @@
+{
+  "name": "ABSENSI WAJAH & GPS",
+  "description": "Aplikasi absensi online & offline berbasis verifikasi wajah biometrik, liveness detection, dan validasi radius GPS untuk perusahaan 1–10 karyawan.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,586 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "User Account",
+      "description": "Authentication account storing hashed password, role, and login rate-limit counters (server-managed).",
+      "type": "object",
+      "properties": {
+        "username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\.\\-]+$",
+          "description": "Unique login username"
+        },
+        "passwordHash": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 256,
+          "description": "Bcrypt hashed password"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["ADMIN", "EMPLOYEE"],
+          "description": "Access role"
+        },
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Linked employee identifier"
+        },
+        "failedAttempts": {
+          "type": "number",
+          "description": "Consecutive failed login count"
+        },
+        "lockedUntilMs": {
+          "type": "number",
+          "description": "Epoch ms until account is unlocked"
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Whether account can log in"
+        },
+        "createdAtIso": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "ISO creation timestamp"
+        }
+      },
+      "required": ["username", "passwordHash", "role", "employeeId", "failedAttempts", "lockedUntilMs", "isActive", "createdAtIso"]
+    },
+    "AdminUser": {
+      "title": "Admin UID Marker",
+      "description": "Firebase Auth UID marker granting direct Firestore admin access when signed in via Google.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "createdAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": ["uid", "email", "createdAtIso"]
+    },
+    "Employee": {
+      "title": "Employee Record",
+      "description": "Identity profile for company staff (1-10 employees).",
+      "type": "object",
+      "properties": {
+        "employeeId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "username": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\.\\-]+$"
+        },
+        "position": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "hasFaceProfile": {
+          "type": "boolean"
+        },
+        "consentAccepted": {
+          "type": "boolean"
+        },
+        "consentTimestampIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "firebaseUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": ["employeeId", "fullName", "username", "position", "hasFaceProfile", "consentAccepted", "isActive", "createdAtIso"]
+    },
+    "FaceProfile": {
+      "title": "Biometric Face Template",
+      "description": "Normalized geometric & blendshape facial signature vector linked to employeeId.",
+      "type": "object",
+      "properties": {
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "descriptorVector": {
+          "type": "array",
+          "description": "Normalized biometric float vector (128 dimensions)"
+        },
+        "sampleCount": {
+          "type": "number"
+        },
+        "qualityScore": {
+          "type": "number"
+        },
+        "encryptionVersion": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "updatedAtIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "registeredBy": {
+          "type": "string",
+          "maxLength": 80
+        }
+      },
+      "required": ["employeeId", "descriptorVector", "sampleCount", "qualityScore", "encryptionVersion", "updatedAtIso", "registeredBy"]
+    },
+    "OfficeSettings": {
+      "title": "Single Office Configuration",
+      "description": "Office coordinates, geofence radius, GPS accuracy threshold, working hours, face match threshold, and monthly email report schedule.",
+      "type": "object",
+      "properties": {
+        "officeName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "latitude": {
+          "type": "number"
+        },
+        "longitude": {
+          "type": "number"
+        },
+        "radiusMeters": {
+          "type": "number"
+        },
+        "maxGpsAccuracyMeters": {
+          "type": "number"
+        },
+        "workStartTime": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[0-2][0-9]:[0-5][0-9]$"
+        },
+        "workEndTime": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[0-2][0-9]:[0-5][0-9]$"
+        },
+        "lateToleranceMinutes": {
+          "type": "number"
+        },
+        "faceMatchThreshold": {
+          "type": "number"
+        },
+        "enableNightShift": {
+          "type": "boolean"
+        },
+        "adminReportEmail": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "autoMonthlyReportEnabled": {
+          "type": "boolean"
+        },
+        "lastMonthlyReportPeriod": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "dataRetentionDays": {
+          "type": "number"
+        },
+        "updatedAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": [
+        "officeName",
+        "latitude",
+        "longitude",
+        "radiusMeters",
+        "maxGpsAccuracyMeters",
+        "workStartTime",
+        "workEndTime",
+        "lateToleranceMinutes",
+        "faceMatchThreshold",
+        "enableNightShift",
+        "adminReportEmail",
+        "autoMonthlyReportEnabled",
+        "dataRetentionDays",
+        "updatedAtIso"
+      ]
+    },
+    "AttendanceRecord": {
+      "title": "Attendance Transaction Record",
+      "description": "Check-in or check-out attendance entry validated on server.",
+      "type": "object",
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "maxLength": 100,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "type": {
+          "type": "string",
+          "enum": ["CHECK_IN", "CHECK_OUT"]
+        },
+        "workDateWib": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "serverTimestampIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "deviceTimestampIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "gpsTimestampIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "latitude": {
+          "type": "number"
+        },
+        "longitude": {
+          "type": "number"
+        },
+        "gpsAccuracyMeters": {
+          "type": "number"
+        },
+        "distanceToOfficeMeters": {
+          "type": "number"
+        },
+        "geofenceValid": {
+          "type": "boolean"
+        },
+        "suspiciousLocationFlags": {
+          "type": "array"
+        },
+        "faceMatchScore": {
+          "type": "number"
+        },
+        "faceVerified": {
+          "type": "boolean"
+        },
+        "livenessVerified": {
+          "type": "boolean"
+        },
+        "livenessDetail": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "attendanceStatus": {
+          "type": "string",
+          "enum": ["VALID", "LATE", "REJECTED", "NEEDS_REVIEW", "PENDING_OFFLINE"]
+        },
+        "syncStatus": {
+          "type": "string",
+          "enum": ["SYNCED", "REJECTED_SERVER", "NEEDS_ADMIN_REVIEW"]
+        },
+        "wasCapturedOffline": {
+          "type": "boolean"
+        },
+        "clockSkewSeconds": {
+          "type": "number"
+        },
+        "rejectionReason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "reviewedBy": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "reviewNote": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "reviewedAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": [
+        "transactionId",
+        "employeeId",
+        "employeeName",
+        "type",
+        "workDateWib",
+        "serverTimestampIso",
+        "deviceTimestampIso",
+        "gpsTimestampIso",
+        "latitude",
+        "longitude",
+        "gpsAccuracyMeters",
+        "distanceToOfficeMeters",
+        "geofenceValid",
+        "faceMatchScore",
+        "faceVerified",
+        "livenessVerified",
+        "attendanceStatus",
+        "syncStatus",
+        "wasCapturedOffline"
+      ]
+    },
+    "AttendanceEvidence": {
+      "title": "Attendance Supporting Evidence",
+      "description": "Compact low-res encrypted/cropped audit thumbnail & sensor summary with retention policy.",
+      "type": "object",
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "maxLength": 100,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "thumbnailDataUrl": {
+          "type": "string",
+          "maxLength": 65000
+        },
+        "expiresAtIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "purpose": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "createdAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": ["transactionId", "employeeId", "thumbnailDataUrl", "expiresAtIso", "purpose", "createdAtIso"]
+    },
+    "SyncEvent": {
+      "title": "Offline Sync Event Log",
+      "description": "Audit log of every offline synchronization attempt and outcome.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "transactionId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "attemptTimestampIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "outcome": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 300
+        }
+      },
+      "required": ["eventId", "transactionId", "employeeId", "attemptTimestampIso", "outcome", "detail"]
+    },
+    "AuditLog": {
+      "title": "System & Admin Audit Trail",
+      "description": "Immutable log of admin edits, approvals, rejections, settings updates, and security checks.",
+      "type": "object",
+      "properties": {
+        "logId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "actorUsername": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "actorRole": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "action": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "previousValueSummary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "newValueSummary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "timestampIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": ["logId", "actorUsername", "actorRole", "action", "targetId", "reason", "timestampIso"]
+    },
+    "AttendanceAppeal": {
+      "title": "Attendance Appeal (Sanggah Absen)",
+      "description": "Employee attendance exception or field duty request reviewed by Admin.",
+      "type": "object",
+      "properties": {
+        "appealId": {
+          "type": "string",
+          "maxLength": 100,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "workDateWib": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["FULL_DAY", "CHECK_IN", "CHECK_OUT"]
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "latitude": {
+          "type": "number"
+        },
+        "longitude": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "APPROVED", "REJECTED"]
+        },
+        "createdAtIso": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "reviewedBy": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "reviewNote": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "reviewedAtIso": {
+          "type": "string",
+          "maxLength": 40
+        }
+      },
+      "required": [
+        "appealId",
+        "employeeId",
+        "employeeName",
+        "workDateWib",
+        "scope",
+        "category",
+        "reason",
+        "status",
+        "createdAtIso"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{username}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Server-managed user credentials & login rate limiting."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Firebase Auth UID registry for verified Google administrators."
+    },
+    "/employees/{employeeId}": {
+      "schema": { "$ref": "#/entities/Employee" },
+      "description": "Employee master records."
+    },
+    "/face_profiles/{employeeId}": {
+      "schema": { "$ref": "#/entities/FaceProfile" },
+      "description": "Protected biometric descriptor vectors."
+    },
+    "/office_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/OfficeSettings" },
+      "description": "Single office geofence, schedule, and email report configuration."
+    },
+    "/attendance_records/{transactionId}": {
+      "schema": { "$ref": "#/entities/AttendanceRecord" },
+      "description": "Server-validated check-in and check-out records."
+    },
+    "/attendance_evidence/{transactionId}": {
+      "schema": { "$ref": "#/entities/AttendanceEvidence" },
+      "description": "Restricted audit thumbnails with retention expiry."
+    },
+    "/sync_events/{eventId}": {
+      "schema": { "$ref": "#/entities/SyncEvent" },
+      "description": "Synchronization attempt logs."
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable administrative and security audit trail."
+    },
+    "/attendance_appeals/{appealId}": {
+      "schema": { "$ref": "#/entities/AttendanceAppeal" },
+      "description": "Employee field-duty and attendance exception requests."
+    }
+  }
+}

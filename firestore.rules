@@ -146,7 +146,7 @@ service cloud.firestore {
         'faceVerified', 'livenessVerified', 'livenessDetail',
         'attendanceStatus', 'syncStatus', 'wasCapturedOffline',
         'clockSkewSeconds', 'rejectionReason', 'reviewedBy', 'reviewNote',
-        'reviewedAtIso', 'hasEvidence'
+        'reviewedAtIso', 'hasEvidence', 'appealId', 'appealStatus', 'appealCategory'
       ]) &&
       data.transactionId is string && data.transactionId.size() <= 100 &&
       data.employeeId is string && data.employeeId.size() <= 64 &&
@@ -173,7 +173,10 @@ service cloud.firestore {
       (!('reviewedBy' in data) || (data.reviewedBy is string && data.reviewedBy.size() <= 80)) &&
       (!('reviewNote' in data) || (data.reviewNote is string && data.reviewNote.size() <= 300)) &&
       (!('reviewedAtIso' in data) || (data.reviewedAtIso is string && data.reviewedAtIso.size() <= 40)) &&
-      (!('hasEvidence' in data) || data.hasEvidence is bool);
+      (!('hasEvidence' in data) || data.hasEvidence is bool) &&
+      (!('appealId' in data) || (data.appealId is string && data.appealId.size() <= 100)) &&
+      (!('appealStatus' in data) || (data.appealStatus == 'PENDING' || data.appealStatus == 'APPROVED' || data.appealStatus == 'REJECTED')) &&
+      (!('appealCategory' in data) || (data.appealCategory is string && data.appealCategory.size() <= 80));
     }
 
     function isValidAttendanceAppeal(data) {
@@ -331,7 +334,8 @@ service cloud.firestore {
         allow update: if isValidSecretKey(serverSecret) && isValidId(transactionId) && isValidAttendanceRecord(incoming()) && (
           incoming().diff(existing()).affectedKeys().hasOnly([
             'attendanceStatus', 'syncStatus', 'geofenceValid', 'faceVerified', 'livenessVerified',
-            'livenessDetail', 'reviewedBy', 'reviewNote', 'reviewedAtIso', 'rejectionReason', 'serverTimestampIso'
+            'livenessDetail', 'reviewedBy', 'reviewNote', 'reviewedAtIso', 'rejectionReason',
+            'serverTimestampIso', 'appealId', 'appealStatus', 'appealCategory'
           ])
         );
         allow delete: if isValidSecretKey(serverSecret) && isValidId(transactionId);

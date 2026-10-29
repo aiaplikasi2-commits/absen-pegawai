@@ -17,6 +17,7 @@ import {
   Smartphone,
   Trash2,
   X,
+  Clock,
 } from 'lucide-react';
 import type {
   AppealScope,
@@ -24,10 +25,17 @@ import type {
   AttendanceRecord,
   AuditLogRecord,
   AuthSessionUser,
+  DailyAttendanceEntry,
+  DailyOverallStatus,
   EmployeeProfile,
   OfficeSettings,
 } from '../types/attendance';
-import { formatWibDateTime, getWibParts } from '../utils/geoAndTime';
+import {
+  formatWibDateLong,
+  formatWibDateTime,
+  formatWibHourMinute,
+  getWibParts,
+} from '../utils/geoAndTime';
 import { acquireFreshGpsLocation } from '../services/gpsValidator';
 import {
   connectGoogleForGmail,
@@ -63,21 +71,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     totalEmployees: 0,
     presentCount: 0,
     lateCount: 0,
+    approvedAppealTodayCount: 0,
     absentCount: 0,
     pendingReviewCount: 0,
     pendingAppealCount: 0,
   });
 
+  const [dailyEntries, setDailyEntries] = useState<DailyAttendanceEntry[]>([]);
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
+  const [attendanceViewMode, setAttendanceViewMode] = useState<'DAILY' | 'RAW'>(
+    'DAILY'
+  );
   const [appeals, setAppeals] = useState<AttendanceAppeal[]>([]);
   const [appealFilter, setAppealFilter] = useState<'PENDING' | 'ALL'>('PENDING');
   const [employees, setEmployees] = useState<EmployeeProfile[]>([]);
   const [settings, setSettings] = useState<OfficeSettings | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLogRecord[]>([]);
 
-  const [dateFilter, setDateFilter] = useState<string>('');
+  const [dateFilter, setDateFilter] = useState<string>(
+    () => getWibParts().dateStr
+  );
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
+  const [exportingExcel, setExportingExcel] = useState<
+    'daily' | 'monthly' | null
+  >(null);
   const [banner, setBanner] = useState<{
     kind: 'success' | 'error' | 'info';
     text: string;
@@ -154,8 +172,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       });
       if (resp.ok) {
         const data = await resp.json();
-        setSummary(data.summary);
+        setSummary((prev) => ({ ...prev, ...data.summary }));
+        setDailyEntries(data.dailyEntries || []);
         setRecords(data.records || []);
+        if (Array.isArray(data.appeals)) {
+          setAppeals(data.appeals);
+        }
         if (data.officeSettings) {
           setSettings(data.officeSettings);
           setSettingsForm((prev) => prev || data.officeSettings);
@@ -187,10 +209,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const usedNums = list
         .map((e) => Number(e.employeeId.replace(/\D/g, '')))
         .filter((n) => Number.isFinite(n));
-      const nextNum = String((usedNums.length ? Math.max(...usedNums) : 0) + 1).padStart(
-        3,
-        '0'
-      );
+      const nextNum = String(
+        (usedNums.length ? Math.max(...usedNums) : 0) + 1
+      ).padStart(3, '0');
       setNewEmpId(`EMP-${nextNum}`);
     }
   }, [token]);
@@ -248,6 +269,80 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       fetchAppeals();
     }
   }, [activeSection, fetchAuditLogs, fetchMonthlyReport, fetchAppeals]);
+
+  const downloadExcelFromApi = async (
+    apiUrlWithJsonFormat: string,
+    mode: 'daily' | 'monthly'
+  ) => {
+    setExportingExcel(mode);
+    setBanner(null);
+    try {
+      const resp = await apiFetch(apiUrlWithJsonFormat, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.base64) {
+        setBanner({
+          kind: 'error',
+          text: data.error || 'Gagal mengunduh file Excel.',
+        });
+        return;
+      }
+
+      const binaryStr = window.atob(data.base64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+
+      const blob = new Blob([bytes], {
+        type:
+          data.mimeType ||
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = data.fileName || `Rekap-Absensi-${getWibParts().dateStr}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+
+      setBanner({
+        kind: 'success',
+        text: `File Excel ${data.fileName} berhasil diunduh.`,
+      });
+    } catch (err: any) {
+      setBanner({
+        kind: 'error',
+        text: err?.message || 'Gagal mengunduh file Excel.',
+      });
+    } finally {
+      setExportingExcel(null);
+    }
+  };
+
+  const handleExportAttendanceExcel = () => {
+    const qs = new URLSearchParams();
+    qs.set('format', 'json');
+    if (dateFilter) qs.set('date', dateFilter);
+    if (searchQuery) qs.set('search', searchQuery);
+    downloadExcelFromApi(
+      `/api/admin/attendance/export-excel?${qs.toString()}`,
+      'daily'
+    );
+  };
+
+  const handleExportMonthlyExcel = () => {
+    const qs = new URLSearchParams();
+    qs.set('format', 'json');
+    qs.set('period', reportPeriod);
+    downloadExcelFromApi(
+      `/api/admin/monthly-report/export-excel?${qs.toString()}`,
+      'monthly'
+    );
+  };
 
   const handleCreateEmployee = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -448,10 +543,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         const empName = appealReviewModal.appeal.employeeName;
         const approved = appealReviewModal.decision === 'APPROVE';
         setAppealReviewModal(null);
-        await Promise.all([fetchAppeals(), fetchAttendanceAndSummary()]);
+        await Promise.all([
+          fetchAppeals(),
+          fetchAttendanceAndSummary(),
+          activeSection === 'MONTHLY_REPORT'
+            ? fetchMonthlyReport()
+            : Promise.resolve(),
+        ]);
         setBanner({
           kind: 'success',
-          text: `Sanggah ${empName} ${approved ? 'disetujui' : 'ditolak'}.`,
+          text: `Sanggah ${empName} ${
+            approved ? 'disetujui & tersinkron ke absensi' : 'ditolak'
+          }.`,
         });
       }
     } finally {
@@ -509,61 +612,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         text: data.error || 'Gagal menyimpan keputusan.',
       });
     } else {
+      const empName = reviewModal.record.employeeName;
       setReviewModal(null);
-      await fetchAttendanceAndSummary();
+      await Promise.all([fetchAttendanceAndSummary(), fetchAppeals()]);
       setBanner({
         kind: 'success',
-        text: `Status absensi ${reviewModal.record.employeeName} diperbarui.`,
+        text: `Status absensi ${empName} diperbarui.`,
       });
     }
-  };
-
-  const handleExportCsv = () => {
-    const headers = [
-      'ID Transaksi',
-      'Tanggal WIB',
-      'ID Karyawan',
-      'Nama',
-      'Jenis',
-      'Waktu WIB',
-      'Latitude',
-      'Longitude',
-      'Jarak (m)',
-      'Status',
-      'Keterangan',
-    ];
-    const lines = [headers.join(',')];
-    for (const r of records) {
-      lines.push(
-        [
-          `"${r.transactionId}"`,
-          `"${r.workDateWib}"`,
-          `"${r.employeeId}"`,
-          `"${r.employeeName}"`,
-          `"${r.type}"`,
-          `"${formatWibDateTime(r.serverTimestampIso || r.deviceTimestampIso)}"`,
-          r.latitude,
-          r.longitude,
-          r.distanceToOfficeMeters,
-          `"${r.attendanceStatus}"`,
-          `"${(r.reviewNote || r.rejectionReason || r.livenessDetail || '').replace(
-            /"/g,
-            '""'
-          )}"`,
-        ].join(',')
-      );
-    }
-    const blob = new Blob([lines.join('\n')], {
-      type: 'text/csv;charset=utf-8;',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Absensi-${dateFilter || getWibParts().dateStr}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const handleUseCurrentGpsForOffice = async () => {
@@ -580,7 +636,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       );
       setBanner({
         kind: 'info',
-        text: `Koordinat (${gps.latitude}, ${gps.longitude}) diambil. Klik Simpan.`,
+        text: `Koordinat (${gps.latitude}, ${gps.longitude}) diambil. Klik Simpan Pengaturan.`,
       });
     } catch (err: any) {
       setBanner({
@@ -768,7 +824,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         await fetchMonthlyReport();
         setBanner({
           kind: 'success',
-          text: `Laporan ${data.period} terkirim ke ${data.sentTo}.`,
+          text: `Rekap Excel (${data.period}) terkirim ke ${data.sentTo}.`,
         });
       }
     } catch (err: any) {
@@ -782,20 +838,94 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const pendingRecords = records.filter(
-    (r) => r.attendanceStatus === 'NEEDS_REVIEW'
+    (r) => r.attendanceStatus === 'NEEDS_REVIEW' && !r.appealId
   );
   const pendingAppeals = appeals.filter((a) => a.status === 'PENDING');
   const displayedAppeals =
     appealFilter === 'PENDING' ? pendingAppeals : appeals;
   const totalNeedsAction =
-    (summary.pendingAppealCount || pendingAppeals.length) +
-    summary.pendingReviewCount;
+    (summary.pendingAppealCount ?? pendingAppeals.length) +
+    (summary.pendingReviewCount ?? pendingRecords.length);
 
   const formatScopeLabel = (scope: AppealScope) => {
-    if (scope === 'CHECK_IN') return 'Masuk';
-    if (scope === 'CHECK_OUT') return 'Pulang';
+    if (scope === 'CHECK_IN') return 'Absen Masuk';
+    if (scope === 'CHECK_OUT') return 'Absen Pulang';
     return 'Masuk & Pulang';
   };
+
+  const getDailyStatusBadgeClass = (status: DailyOverallStatus) => {
+    switch (status) {
+      case 'HADIR_LENGKAP':
+      case 'SUDAH_MASUK':
+        return 'bg-emerald-50 text-emerald-900 border-emerald-300';
+      case 'HADIR_SANGGAH':
+        return 'bg-sky-50 text-sky-900 border-sky-300';
+      case 'TERLAMBAT':
+      case 'PULANG_CEPAT':
+        return 'bg-amber-50 text-amber-900 border-amber-300';
+      case 'MENUNGGU_SANGGAH':
+      case 'MENUNGGU_REVIEW':
+        return 'bg-amber-100/80 text-amber-950 border-amber-400';
+      case 'DITOLAK':
+        return 'bg-red-50 text-red-900 border-red-300';
+      case 'BELUM_HADIR':
+      default:
+        return 'bg-slate-100 text-slate-700 border-slate-300';
+    }
+  };
+
+  const renderRecordStatusBadge = (rec: AttendanceRecord) => {
+    if (rec.appealStatus === 'APPROVED' && rec.attendanceStatus === 'VALID') {
+      return (
+        <span className="inline-block rounded-md border border-sky-300 bg-sky-50 px-2 py-0.5 text-[11px] font-bold text-sky-900 whitespace-nowrap">
+          Sanggah Disetujui
+        </span>
+      );
+    }
+    if (rec.appealStatus === 'PENDING') {
+      return (
+        <span className="inline-block rounded-md border border-amber-400 bg-amber-100/80 px-2 py-0.5 text-[11px] font-bold text-amber-950 whitespace-nowrap">
+          Menunggu Sanggah
+        </span>
+      );
+    }
+    if (rec.attendanceStatus === 'VALID') {
+      return (
+        <span className="inline-block rounded-md border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[11px] font-bold text-emerald-900 whitespace-nowrap">
+          Tepat Waktu
+        </span>
+      );
+    }
+    if (rec.attendanceStatus === 'LATE') {
+      return (
+        <span className="inline-block rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-900 whitespace-nowrap">
+          Terlambat
+        </span>
+      );
+    }
+    if (rec.attendanceStatus === 'EARLY_LEAVE') {
+      return (
+        <span className="inline-block rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-900 whitespace-nowrap">
+          Pulang Cepat
+        </span>
+      );
+    }
+    if (rec.attendanceStatus === 'NEEDS_REVIEW') {
+      return (
+        <span className="inline-block rounded-md border border-amber-400 bg-amber-50 px-2 py-0.5 text-[11px] font-bold text-amber-950 whitespace-nowrap">
+          Perlu Review
+        </span>
+      );
+    }
+    return (
+      <span className="inline-block rounded-md border border-red-300 bg-red-50 px-2 py-0.5 text-[11px] font-bold text-red-900 whitespace-nowrap">
+        Ditolak
+      </span>
+    );
+  };
+
+  const todayWibStr = getWibParts().dateStr;
+  const isShowingAllDates = !dateFilter || dateFilter === 'ALL';
 
   return (
     <div className="max-w-7xl mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
@@ -809,43 +939,56 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               : 'border-sky-300 bg-sky-50 text-sky-950'
           }`}
         >
-          <span className="min-w-0 break-words">{banner.text}</span>
+          <span className="min-w-0 break-words font-medium">{banner.text}</span>
           <button
             type="button"
             onClick={() => setBanner(null)}
-            className="min-h-[36px] px-2 text-xs font-semibold underline shrink-0"
+            className="min-h-[36px] px-2 text-xs font-semibold underline shrink-0 whitespace-nowrap"
           >
             Tutup
           </button>
         </div>
       )}
 
-      {/* SECTION 1: OVERVIEW */}
+      {/* SECTION 1: OVERVIEW (DATA ABSENSI TERPADU & SINKRON SANGGAH) */}
       {activeSection === 'OVERVIEW' && (
         <div className="space-y-4 sm:space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
             <div className="rounded-xl bg-white border border-slate-200 p-4">
-              <span className="text-xs text-slate-500 block">Karyawan</span>
+              <span className="text-xs font-medium text-slate-600 block">
+                Total Karyawan
+              </span>
               <span className="text-2xl sm:text-3xl font-bold font-mono text-slate-900 tabular-nums mt-1 block">
                 {summary.totalEmployees}
               </span>
             </div>
             <div className="rounded-xl bg-white border border-slate-200 p-4">
-              <span className="text-xs text-slate-500 block truncate">
-                Hadir ({summary.dateWib})
+              <span className="text-xs font-medium text-slate-600 block truncate">
+                Hadir · {formatWibDateLong(summary.dateWib)}
               </span>
-              <span className="text-2xl sm:text-3xl font-bold font-mono text-emerald-700 tabular-nums mt-1 block">
-                {summary.presentCount}
-              </span>
+              <div className="flex items-baseline gap-2 mt-1">
+                <span className="text-2xl sm:text-3xl font-bold font-mono text-emerald-700 tabular-nums">
+                  {summary.presentCount}
+                </span>
+                {summary.approvedAppealTodayCount > 0 && (
+                  <span className="text-[11px] font-semibold text-sky-800 whitespace-nowrap">
+                    ({summary.approvedAppealTodayCount} sanggah)
+                  </span>
+                )}
+              </div>
             </div>
             <div className="rounded-xl bg-white border border-slate-200 p-4">
-              <span className="text-xs text-slate-500 block">Terlambat</span>
+              <span className="text-xs font-medium text-slate-600 block">
+                Terlambat
+              </span>
               <span className="text-2xl sm:text-3xl font-bold font-mono text-amber-700 tabular-nums mt-1 block">
                 {summary.lateCount}
               </span>
             </div>
             <div className="rounded-xl bg-white border border-slate-200 p-4">
-              <span className="text-xs text-slate-500 block">Belum Hadir</span>
+              <span className="text-xs font-medium text-slate-600 block">
+                Belum Hadir
+              </span>
               <span className="text-2xl sm:text-3xl font-bold font-mono text-slate-700 tabular-nums mt-1 block">
                 {summary.absentCount}
               </span>
@@ -857,70 +1000,429 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="flex items-center gap-2.5 text-xs sm:text-sm text-amber-950">
                 <AlertTriangle className="w-5 h-5 text-amber-700 shrink-0" />
                 <span>
-                  <strong>{totalNeedsAction} pengajuan</strong> menunggu persetujuan Admin.
+                  <strong>{totalNeedsAction} pengajuan sanggah / review</strong>{' '}
+                  menunggu keputusan Admin.
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => onChangeSection('APPEALS')}
-                className="w-full sm:w-auto rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px]"
+                className="w-full sm:w-auto rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px] whitespace-nowrap"
               >
-                Buka Menu Sanggah
+                Periksa Sanggah ({totalNeedsAction})
               </button>
             </div>
           )}
 
           <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <h2 className="text-base font-bold text-slate-900">
-                Data Absensi
-              </h2>
-              <div className="grid grid-cols-1 sm:flex sm:flex-wrap items-center gap-2.5">
-                <div className="relative w-full sm:w-auto">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <h2 className="text-base font-bold text-slate-900">
+                  Daftar Kehadiran &amp; Sanggah Tersinkron
+                </h2>
+                <p className="text-xs text-slate-600">
+                  {isShowingAllDates
+                    ? 'Menampilkan seluruh tanggal kehadiran'
+                    : `Tanggal kerja: ${formatWibDateLong(dateFilter)}`}
+                </p>
+              </div>
+
+              <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5">
+                <div className="relative w-full sm:w-52">
                   <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Cari nama / ID..."
-                    className="w-full sm:w-48 pl-9 pr-3 py-2 text-base sm:text-xs rounded-xl border border-slate-300 focus:outline-none focus:border-[#0F2942] min-h-[44px]"
+                    className="w-full pl-9 pr-3 py-2 text-base sm:text-xs rounded-xl border border-slate-300 focus:outline-none focus:border-[#0F2942] min-h-[44px]"
                   />
                 </div>
-                <div className="flex items-center gap-2 w-full sm:w-auto">
+
+                <div className="flex items-center gap-1.5">
                   <input
                     type="date"
-                    value={dateFilter}
-                    onChange={(e) => setDateFilter(e.target.value)}
-                    className="flex-1 sm:w-auto px-3 py-2 text-base sm:text-xs rounded-xl border border-slate-300 focus:outline-none focus:border-[#0F2942] min-h-[44px]"
+                    value={isShowingAllDates ? '' : dateFilter}
+                    onChange={(e) => setDateFilter(e.target.value || 'ALL')}
+                    className="flex-1 sm:w-auto px-3 py-2 text-base sm:text-xs font-mono rounded-xl border border-slate-300 focus:outline-none focus:border-[#0F2942] min-h-[44px]"
                   />
-                  {dateFilter && (
-                    <button
-                      type="button"
-                      onClick={() => setDateFilter('')}
-                      className="text-xs font-semibold text-slate-600 underline px-2 min-h-[44px] shrink-0"
-                    >
-                      Semua
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setDateFilter(todayWibStr)}
+                    className={`rounded-xl border px-3 py-2 text-xs font-semibold min-h-[44px] whitespace-nowrap ${
+                      dateFilter === todayWibStr
+                        ? 'border-[#0F2942] bg-[#0F2942] text-white'
+                        : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    Hari Ini
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDateFilter('ALL')}
+                    className={`rounded-xl border px-3 py-2 text-xs font-semibold min-h-[44px] whitespace-nowrap ${
+                      isShowingAllDates
+                        ? 'border-[#0F2942] bg-[#0F2942] text-white'
+                        : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    Semua
+                  </button>
                 </div>
+
                 <button
                   type="button"
-                  onClick={handleExportCsv}
-                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#0F2942] px-3.5 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px]"
+                  disabled={exportingExcel === 'daily'}
+                  onClick={handleExportAttendanceExcel}
+                  className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-700 px-3.5 py-2.5 text-xs font-bold text-white hover:bg-emerald-800 disabled:opacity-50 min-h-[44px] whitespace-nowrap"
                 >
                   <FileSpreadsheet className="w-4 h-4 shrink-0" />
-                  <span>CSV</span>
+                  <span>
+                    {exportingExcel === 'daily'
+                      ? 'Menyiapkan Excel...'
+                      : 'Unduh Excel (.xlsx)'}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* Segmented Mode: Rekap Harian (paired Masuk/Pulang) vs Log Transaksi */}
+            <div className="flex items-center justify-between gap-2 border-y border-slate-100 py-2.5">
+              <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-slate-100 p-1 w-full sm:w-72">
+                <button
+                  type="button"
+                  onClick={() => setAttendanceViewMode('DAILY')}
+                  className={`min-h-[38px] rounded-lg px-3 text-xs font-bold whitespace-nowrap ${
+                    attendanceViewMode === 'DAILY'
+                      ? 'bg-white text-[#0F2942] shadow-sm'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  Rekap Harian ({dailyEntries.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAttendanceViewMode('RAW')}
+                  className={`min-h-[38px] rounded-lg px-3 text-xs font-bold whitespace-nowrap ${
+                    attendanceViewMode === 'RAW'
+                      ? 'bg-white text-[#0F2942] shadow-sm'
+                      : 'text-slate-600'
+                  }`}
+                >
+                  Log Transaksi ({records.length})
                 </button>
               </div>
             </div>
 
             {loading ? (
               <p className="text-xs text-slate-500 py-8 text-center">
-                Memuat...
+                Memuat data absensi...
               </p>
+            ) : attendanceViewMode === 'DAILY' ? (
+              dailyEntries.length === 0 ? (
+                <p className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-200 rounded-xl">
+                  Belum ada data kehadiran pada filter ini.
+                </p>
+              ) : (
+                <>
+                  {/* Mobile Android Cards — Paired Masuk & Pulang, High Legibility */}
+                  <div className="md:hidden space-y-3">
+                    {dailyEntries.map((entry) => (
+                      <div
+                        key={entry.key}
+                        className="rounded-xl border border-slate-200 bg-white p-3.5 space-y-3 text-xs"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <span className="font-bold text-sm text-slate-900 block truncate">
+                              {entry.employeeName}
+                            </span>
+                            <span className="font-mono text-[11px] text-slate-500 block">
+                              {entry.employeeId} · {entry.position}
+                            </span>
+                            <span className="text-[11px] font-medium text-slate-600 block mt-0.5">
+                              {formatWibDateLong(entry.workDateWib)}
+                            </span>
+                          </div>
+                          <span
+                            className={`inline-block rounded-md border px-2.5 py-1 text-[11px] font-bold shrink-0 whitespace-nowrap ${getDailyStatusBadgeClass(
+                              entry.overallStatus
+                            )}`}
+                          >
+                            {entry.overallLabel}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-2 rounded-lg bg-slate-50 border border-slate-200/80 p-2.5">
+                          <div>
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 block">
+                              Jam Masuk
+                            </span>
+                            <span className="font-mono text-sm font-bold text-slate-900 tabular-nums block mt-0.5">
+                              {entry.checkInTimeWib}
+                            </span>
+                            <span className="text-[11px] text-slate-600 block truncate">
+                              {entry.checkInStatusLabel}
+                            </span>
+                          </div>
+                          <div className="border-x border-slate-200 px-2">
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 block">
+                              Jam Pulang
+                            </span>
+                            <span className="font-mono text-sm font-bold text-slate-900 tabular-nums block mt-0.5">
+                              {entry.checkOutTimeWib}
+                            </span>
+                            <span className="text-[11px] text-slate-600 block truncate">
+                              {entry.checkOutStatusLabel}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 block">
+                              Durasi
+                            </span>
+                            <span className="font-mono text-sm font-bold text-slate-900 tabular-nums block mt-0.5">
+                              {entry.durationLabel}
+                            </span>
+                            <span className="text-[11px] text-slate-600 block truncate">
+                              {entry.sourceLabel}
+                            </span>
+                          </div>
+                        </div>
+
+                        {(entry.notes || entry.locationOrFaceSummary !== '-') && (
+                          <div className="text-[11px] text-slate-700 space-y-0.5 bg-slate-50/70 rounded-lg px-2.5 py-2 border border-slate-100">
+                            {entry.locationOrFaceSummary !== '-' && (
+                              <p className="font-mono text-slate-600">
+                                {entry.locationOrFaceSummary}
+                              </p>
+                            )}
+                            {entry.notes && (
+                              <p className="font-medium text-slate-800 break-words">
+                                {entry.notes}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                          <div className="flex flex-wrap gap-1.5">
+                            {entry.checkInRecord && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openEvidenceModal(entry.checkInRecord!)
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px] whitespace-nowrap"
+                              >
+                                <Eye className="w-3.5 h-3.5 shrink-0" />
+                                <span>Detail Masuk</span>
+                              </button>
+                            )}
+                            {entry.checkOutRecord && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openEvidenceModal(entry.checkOutRecord!)
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px] whitespace-nowrap"
+                              >
+                                <Eye className="w-3.5 h-3.5 shrink-0" />
+                                <span>Detail Pulang</span>
+                              </button>
+                            )}
+                          </div>
+
+                          {entry.linkedAppeal?.status === 'PENDING' && (
+                            <div className="flex items-center gap-1.5 ml-auto">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setAppealReviewModal({
+                                    appeal: entry.linkedAppeal!,
+                                    decision: 'APPROVE',
+                                    note: '',
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-800 min-h-[38px] whitespace-nowrap"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                                <span>Setujui Sanggah</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setAppealReviewModal({
+                                    appeal: entry.linkedAppeal!,
+                                    decision: 'REJECT',
+                                    note: '',
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg bg-red-700 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-red-800 min-h-[38px] whitespace-nowrap"
+                              >
+                                <XCircle className="w-3.5 h-3.5 shrink-0" />
+                                <span>Tolak</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Desktop Table — Paired Jam Masuk & Jam Pulang */}
+                  <div className="hidden md:block overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 text-slate-600">
+                          <th className="py-2.5 pr-3 font-semibold">Tanggal</th>
+                          <th className="py-2.5 pr-3 font-semibold">Karyawan</th>
+                          <th className="py-2.5 pr-3 font-semibold">Jam Masuk</th>
+                          <th className="py-2.5 pr-3 font-semibold">Jam Pulang</th>
+                          <th className="py-2.5 pr-3 font-semibold">Durasi</th>
+                          <th className="py-2.5 pr-3 font-semibold">Status</th>
+                          <th className="py-2.5 pr-3 font-semibold">
+                            Sumber &amp; Keterangan
+                          </th>
+                          <th className="py-2.5 font-semibold text-right">
+                            Tindakan
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {dailyEntries.map((entry) => (
+                          <tr
+                            key={entry.key}
+                            className="hover:bg-slate-50/80 align-top"
+                          >
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <span className="font-semibold text-slate-900 block">
+                                {formatWibDateLong(entry.workDateWib)}
+                              </span>
+                              <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                                {entry.workDateWib}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3">
+                              <span className="font-bold text-slate-900 block">
+                                {entry.employeeName}
+                              </span>
+                              <span className="font-mono text-[11px] text-slate-500">
+                                {entry.employeeId} · {entry.position}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <span className="font-mono text-sm font-bold text-slate-900 tabular-nums block">
+                                {entry.checkInTimeWib}
+                              </span>
+                              <span className="text-[11px] text-slate-600">
+                                {entry.checkInStatusLabel}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <span className="font-mono text-sm font-bold text-slate-900 tabular-nums block">
+                                {entry.checkOutTimeWib}
+                              </span>
+                              <span className="text-[11px] text-slate-600">
+                                {entry.checkOutStatusLabel}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 font-mono text-slate-800 tabular-nums whitespace-nowrap">
+                              {entry.durationLabel}
+                            </td>
+                            <td className="py-3 pr-3 whitespace-nowrap">
+                              <span
+                                className={`inline-block rounded-md border px-2.5 py-1 text-[11px] font-bold ${getDailyStatusBadgeClass(
+                                  entry.overallStatus
+                                )}`}
+                              >
+                                {entry.overallLabel}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 max-w-xs">
+                              <span className="font-semibold text-slate-800 block">
+                                {entry.sourceLabel}
+                              </span>
+                              {entry.locationOrFaceSummary !== '-' && (
+                                <span className="font-mono text-[11px] text-slate-500 block">
+                                  {entry.locationOrFaceSummary}
+                                </span>
+                              )}
+                              {entry.notes && (
+                                <span className="text-[11px] text-slate-700 block mt-0.5 break-words">
+                                  {entry.notes}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3 text-right whitespace-nowrap">
+                              <div className="inline-flex flex-wrap justify-end gap-1.5">
+                                {entry.linkedAppeal?.status === 'PENDING' && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setAppealReviewModal({
+                                          appeal: entry.linkedAppeal!,
+                                          decision: 'APPROVE',
+                                          note: '',
+                                        })
+                                      }
+                                      className="inline-flex items-center gap-1 rounded-lg bg-emerald-700 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-emerald-800 min-h-[36px]"
+                                    >
+                                      <CheckCircle2 className="w-3.5 h-3.5" />
+                                      <span>Setujui</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setAppealReviewModal({
+                                          appeal: entry.linkedAppeal!,
+                                          decision: 'REJECT',
+                                          note: '',
+                                        })
+                                      }
+                                      className="inline-flex items-center gap-1 rounded-lg bg-red-700 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-red-800 min-h-[36px]"
+                                    >
+                                      <XCircle className="w-3.5 h-3.5" />
+                                      <span>Tolak</span>
+                                    </button>
+                                  </>
+                                )}
+                                {entry.checkInRecord && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      openEvidenceModal(entry.checkInRecord!)
+                                    }
+                                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 min-h-[36px]"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>Masuk</span>
+                                  </button>
+                                )}
+                                {entry.checkOutRecord && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      openEvidenceModal(entry.checkOutRecord!)
+                                    }
+                                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 min-h-[36px]"
+                                  >
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>Pulang</span>
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )
             ) : records.length === 0 ? (
               <p className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-200 rounded-xl">
-                Belum ada data absensi.
+                Belum ada transaksi absensi pada filter ini.
               </p>
             ) : (
               <>
@@ -937,53 +1439,39 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           </span>
                           <span className="font-mono text-[11px] text-slate-500">
                             {rec.employeeId} ·{' '}
-                            {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'} ·{' '}
-                            {rec.workDateWib}
+                            {rec.type === 'CHECK_IN' ? 'Absen Masuk' : 'Absen Pulang'} ·{' '}
+                            {formatWibDateLong(rec.workDateWib)}
                           </span>
                         </div>
-                        <span className="font-semibold shrink-0">
-                          {rec.attendanceStatus === 'VALID' && (
-                            <span className="text-emerald-700">Valid</span>
-                          )}
-                          {rec.attendanceStatus === 'LATE' && (
-                            <span className="text-amber-700">Terlambat</span>
-                          )}
-                          {rec.attendanceStatus === 'NEEDS_REVIEW' && (
-                            <span className="text-amber-700">Pending</span>
-                          )}
-                          {rec.attendanceStatus === 'REJECTED' && (
-                            <span className="text-red-700">Ditolak</span>
-                          )}
-                        </span>
+                        {renderRecordStatusBadge(rec)}
                       </div>
 
-                      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-slate-600 tabular-nums">
-                        <span>
-                          {formatWibDateTime(
+                      <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-slate-700 tabular-nums">
+                        <span className="inline-flex items-center gap-1 font-bold text-slate-900">
+                          <Clock className="w-3.5 h-3.5 text-slate-500" />
+                          {formatWibHourMinute(
                             rec.serverTimestampIso || rec.deviceTimestampIso
                           )}
                         </span>
-                        <span className="font-sans">
-                          {rec.livenessDetail.startsWith('Sanggah')
-                            ? rec.livenessDetail
-                            : `${rec.distanceToOfficeMeters}m · ${(
+                        <span className="font-sans text-slate-600">
+                          {rec.appealId || rec.livenessDetail.startsWith('Sanggah')
+                            ? rec.reviewNote || rec.livenessDetail
+                            : `${rec.distanceToOfficeMeters}m · Wajah ${(
                                 rec.faceMatchScore * 100
                               ).toFixed(0)}%`}
                         </span>
                       </div>
 
-                      {rec.hasEvidence && (
-                        <div className="flex justify-end pt-0.5">
-                          <button
-                            type="button"
-                            onClick={() => openEvidenceModal(rec)}
-                            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px]"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>Foto</span>
-                          </button>
-                        </div>
-                      )}
+                      <div className="flex justify-end pt-0.5">
+                        <button
+                          type="button"
+                          onClick={() => openEvidenceModal(rec)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px]"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>Detail</span>
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -991,11 +1479,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <div className="hidden md:block overflow-x-auto">
                   <table className="w-full text-left text-xs">
                     <thead>
-                      <tr className="border-b border-slate-200 text-slate-500">
+                      <tr className="border-b border-slate-200 text-slate-600">
                         <th className="py-2.5 pr-3 font-semibold">Tanggal</th>
                         <th className="py-2.5 pr-3 font-semibold">Karyawan</th>
                         <th className="py-2.5 pr-3 font-semibold">Jenis</th>
-                        <th className="py-2.5 pr-3 font-semibold">Waktu WIB</th>
+                        <th className="py-2.5 pr-3 font-semibold">Jam WIB</th>
                         <th className="py-2.5 pr-3 font-semibold">Keterangan</th>
                         <th className="py-2.5 pr-3 font-semibold">Status</th>
                         <th className="py-2.5 font-semibold text-right">Bukti</th>
@@ -1003,9 +1491,17 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {records.map((rec) => (
-                        <tr key={rec.transactionId} className="hover:bg-slate-50/70">
-                          <td className="py-3 pr-3 font-mono text-slate-800 tabular-nums">
-                            {rec.workDateWib}
+                        <tr
+                          key={rec.transactionId}
+                          className="hover:bg-slate-50/70"
+                        >
+                          <td className="py-3 pr-3 whitespace-nowrap">
+                            <span className="font-semibold text-slate-900 block">
+                              {formatWibDateLong(rec.workDateWib)}
+                            </span>
+                            <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                              {rec.workDateWib}
+                            </span>
                           </td>
                           <td className="py-3 pr-3">
                             <span className="font-semibold text-slate-900 block">
@@ -1015,36 +1511,32 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               {rec.employeeId}
                             </span>
                           </td>
-                          <td className="py-3 pr-3 font-semibold text-slate-800">
-                            {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'}
+                          <td className="py-3 pr-3 font-semibold text-slate-800 whitespace-nowrap">
+                            {rec.type === 'CHECK_IN'
+                              ? 'Absen Masuk'
+                              : 'Absen Pulang'}
                           </td>
-                          <td className="py-3 pr-3 font-mono text-slate-700 tabular-nums">
-                            {formatWibDateTime(
+                          <td className="py-3 pr-3 font-mono font-bold text-slate-900 tabular-nums whitespace-nowrap">
+                            {formatWibHourMinute(
                               rec.serverTimestampIso || rec.deviceTimestampIso
                             )}
                           </td>
-                          <td className="py-3 pr-3 text-slate-700">
-                            {rec.livenessDetail.startsWith('Sanggah')
-                              ? rec.livenessDetail
+                          <td className="py-3 pr-3 text-slate-700 max-w-xs break-words">
+                            {rec.appealId ||
+                            rec.livenessDetail.startsWith('Sanggah')
+                              ? `${rec.livenessDetail}${
+                                  rec.reviewNote ? ` — ${rec.reviewNote}` : ''
+                                }`
                               : `${rec.distanceToOfficeMeters}m · ±${
                                   rec.gpsAccuracyMeters
-                                }m · ${(rec.faceMatchScore * 100).toFixed(0)}%`}
+                                }m · Wajah ${(rec.faceMatchScore * 100).toFixed(
+                                  0
+                                )}%`}
                           </td>
-                          <td className="py-3 pr-3 font-semibold">
-                            {rec.attendanceStatus === 'VALID' && (
-                              <span className="text-emerald-700">Valid</span>
-                            )}
-                            {rec.attendanceStatus === 'LATE' && (
-                              <span className="text-amber-700">Terlambat</span>
-                            )}
-                            {rec.attendanceStatus === 'NEEDS_REVIEW' && (
-                              <span className="text-amber-700">Pending</span>
-                            )}
-                            {rec.attendanceStatus === 'REJECTED' && (
-                              <span className="text-red-700">Ditolak</span>
-                            )}
+                          <td className="py-3 pr-3">
+                            {renderRecordStatusBadge(rec)}
                           </td>
-                          <td className="py-3 text-right">
+                          <td className="py-3 text-right whitespace-nowrap">
                             <button
                               type="button"
                               onClick={() => openEvidenceModal(rec)}
@@ -1070,14 +1562,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         <div className="space-y-4 sm:space-y-6">
           <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <h2 className="text-base font-bold text-slate-900">
-                Sanggah Absen ({pendingAppeals.length} Menunggu)
-              </h2>
+              <div>
+                <h2 className="text-base font-bold text-slate-900">
+                  Sanggah Absen ({pendingAppeals.length} Menunggu)
+                </h2>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  Keputusan sanggah otomatis memperbarui status hadir/terlambat/pulang di Data Absensi &amp; Rekap Excel.
+                </p>
+              </div>
               <div className="grid grid-cols-2 gap-1.5 rounded-xl bg-slate-100 p-1 w-full sm:w-56">
                 <button
                   type="button"
                   onClick={() => setAppealFilter('PENDING')}
-                  className={`min-h-[38px] rounded-lg text-xs font-bold ${
+                  className={`min-h-[38px] rounded-lg text-xs font-bold whitespace-nowrap ${
                     appealFilter === 'PENDING'
                       ? 'bg-white text-[#0F2942] shadow-sm'
                       : 'text-slate-600'
@@ -1088,7 +1585,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <button
                   type="button"
                   onClick={() => setAppealFilter('ALL')}
-                  className={`min-h-[38px] rounded-lg text-xs font-bold ${
+                  className={`min-h-[38px] rounded-lg text-xs font-bold whitespace-nowrap ${
                     appealFilter === 'ALL'
                       ? 'bg-white text-[#0F2942] shadow-sm'
                       : 'text-slate-600'
@@ -1101,7 +1598,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
             {displayedAppeals.length === 0 ? (
               <p className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-200 rounded-xl">
-                Tidak ada pengajuan sanggah.
+                Tidak ada pengajuan sanggah pada kategori ini.
               </p>
             ) : (
               <div className="divide-y divide-slate-100">
@@ -1110,7 +1607,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     key={apl.appealId}
                     className="py-4 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
                   >
-                    <div className="space-y-1 min-w-0">
+                    <div className="space-y-1.5 min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-bold text-sm text-slate-900">
                           {apl.employeeName}
@@ -1118,31 +1615,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span className="font-mono text-[11px] text-slate-500">
                           ({apl.employeeId})
                         </span>
-                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-800 font-semibold">
-                          {apl.workDateWib} · {formatScopeLabel(apl.scope)}
+                        <span className="px-2 py-0.5 rounded-md border border-slate-200 bg-slate-100 text-slate-800 font-semibold">
+                          {formatWibDateLong(apl.workDateWib)} ·{' '}
+                          {formatScopeLabel(apl.scope)}
                         </span>
-                        <span className="font-semibold text-[#0F2942]">
+                        <span className="px-2 py-0.5 rounded-md border border-sky-200 bg-sky-50 font-semibold text-[#0F2942]">
                           {apl.category}
                         </span>
                       </div>
-                      <p className="text-slate-700 break-words">{apl.reason}</p>
+                      <p className="text-slate-800 font-medium break-words">
+                        {apl.reason}
+                      </p>
                       {typeof apl.latitude === 'number' &&
                         typeof apl.longitude === 'number' && (
-                          <p className="font-mono text-[11px] text-slate-500">
+                          <p className="font-mono text-[11px] text-slate-500 tabular-nums">
                             GPS Lapangan: {apl.latitude}, {apl.longitude}
                           </p>
                         )}
                       {apl.status !== 'PENDING' && (
-                        <p className="text-[11px] text-slate-500">
-                          {apl.status === 'APPROVED' ? 'Disetujui' : 'Ditolak'}{' '}
-                          oleh {apl.reviewedBy || 'Admin'}
-                          {apl.reviewNote ? ` · ${apl.reviewNote}` : ''}
+                        <p className="text-[11px] text-slate-600">
+                          {apl.status === 'APPROVED'
+                            ? 'Disetujui & Tersinkron ke Absensi'
+                            : 'Ditolak'}{' '}
+                          oleh <strong>{apl.reviewedBy || 'Admin'}</strong>
+                          {apl.reviewNote ? ` · Catatan: ${apl.reviewNote}` : ''}
                         </p>
                       )}
                     </div>
 
                     {apl.status === 'PENDING' ? (
-                      <div className="grid grid-cols-2 gap-2 shrink-0 md:w-52">
+                      <div className="grid grid-cols-2 gap-2 shrink-0 md:w-56">
                         <button
                           type="button"
                           onClick={() =>
@@ -1152,7 +1654,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               note: '',
                             })
                           }
-                          className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-700 px-3 py-2.5 text-xs font-bold text-white hover:bg-emerald-800 min-h-[44px]"
+                          className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-700 px-3 py-2.5 text-xs font-bold text-white hover:bg-emerald-800 min-h-[44px] whitespace-nowrap"
                         >
                           <CheckCircle2 className="w-4 h-4 shrink-0" />
                           <span>Setujui</span>
@@ -1166,7 +1668,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               note: '',
                             })
                           }
-                          className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-red-700 px-3 py-2.5 text-xs font-bold text-white hover:bg-red-800 min-h-[44px]"
+                          className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-red-700 px-3 py-2.5 text-xs font-bold text-white hover:bg-red-800 min-h-[44px] whitespace-nowrap"
                         >
                           <XCircle className="w-4 h-4 shrink-0" />
                           <span>Tolak</span>
@@ -1174,13 +1676,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       </div>
                     ) : (
                       <span
-                        className={`font-bold shrink-0 ${
+                        className={`inline-block rounded-md border px-2.5 py-1 text-[11px] font-bold shrink-0 whitespace-nowrap ${
                           apl.status === 'APPROVED'
-                            ? 'text-emerald-700'
-                            : 'text-red-700'
+                            ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                            : 'border-red-300 bg-red-50 text-red-900'
                         }`}
                       >
-                        {apl.status === 'APPROVED' ? 'Disetujui' : 'Ditolak'}
+                        {apl.status === 'APPROVED'
+                          ? 'Disetujui · Sinkron'
+                          : 'Ditolak'}
                       </span>
                     )}
                   </div>
@@ -1192,7 +1696,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           {pendingRecords.length > 0 && (
             <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
               <h2 className="text-base font-bold text-slate-900">
-                Absensi Offline Menunggu ({pendingRecords.length})
+                Absensi Offline / Perlu Pemeriksaan ({pendingRecords.length})
               </h2>
               <div className="divide-y divide-slate-100">
                 {pendingRecords.map((rec) => (
@@ -1203,16 +1707,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <div className="space-y-1">
                       <p className="font-bold text-sm text-slate-900">
                         {rec.employeeName} ({rec.employeeId}) ·{' '}
-                        {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'}{' '}
-                        {rec.workDateWib}
+                        {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'} ·{' '}
+                        {formatWibDateLong(rec.workDateWib)}
                       </p>
-                      <p className="font-mono text-[11px] text-slate-600">
+                      <p className="font-mono text-[11px] text-slate-600 tabular-nums">
                         {formatWibDateTime(rec.deviceTimestampIso)} ·{' '}
-                        {rec.distanceToOfficeMeters}m ·{' '}
+                        {rec.distanceToOfficeMeters}m · Wajah{' '}
                         {(rec.faceMatchScore * 100).toFixed(0)}%
                       </p>
                       {rec.rejectionReason && (
-                        <p className="text-amber-800">{rec.rejectionReason}</p>
+                        <p className="text-amber-800 font-medium">
+                          {rec.rejectionReason}
+                        </p>
                       )}
                     </div>
                     <div className="grid grid-cols-3 gap-2 shrink-0 md:w-64">
@@ -1354,9 +1860,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </form>
 
           <div className="lg:col-span-8 rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
-            <h2 className="text-base font-bold text-slate-900">
-              Karyawan ({employees.length}/10)
-            </h2>
+            <div>
+              <h2 className="text-base font-bold text-slate-900">
+                Daftar Karyawan ({employees.length}/10)
+              </h2>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Rekam wajah dapat dilakukan oleh Admin di bawah ini atau langsung dari akun masing-masing karyawan.
+              </p>
+            </div>
 
             {employees.length === 0 ? (
               <p className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-200 rounded-xl">
@@ -1375,8 +1886,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           {emp.fullName}
                         </span>
                         <span
-                          className={`text-[11px] font-semibold ${
-                            emp.isActive ? 'text-emerald-700' : 'text-slate-400'
+                          className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold ${
+                            emp.isActive
+                              ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
+                              : 'border-slate-300 bg-slate-100 text-slate-500'
                           }`}
                         >
                           {emp.isActive ? 'Aktif' : 'Nonaktif'}
@@ -1387,7 +1900,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <span className="font-sans">{emp.position}</span>
                       </p>
                       <p className="text-[11px]">
-                        Wajah:{' '}
+                        Biometrik Wajah:{' '}
                         <strong
                           className={
                             emp.hasFaceProfile
@@ -1395,7 +1908,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                               : 'text-amber-700'
                           }
                         >
-                          {emp.hasFaceProfile ? 'Terdaftar' : 'Belum Terdaftar'}
+                          {emp.hasFaceProfile
+                            ? 'Terdaftar'
+                            : 'Belum Direkam (Bisa rekam dari akun karyawan / Admin)'}
                         </strong>
                       </p>
                     </div>
@@ -1404,11 +1919,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <button
                         type="button"
                         onClick={() => setEnrollingEmployee(emp)}
-                        className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#0F2942] px-3 py-2 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[40px]"
+                        className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[#0F2942] px-3 py-2 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[40px] whitespace-nowrap"
                       >
                         <ScanFace className="w-4 h-4 shrink-0" />
                         <span>
-                          {emp.hasFaceProfile ? 'Ubah Wajah' : 'Daftar Wajah'}
+                          {emp.hasFaceProfile ? 'Ubah Wajah' : 'Rekam Wajah'}
                         </span>
                       </button>
                       <button
@@ -1417,14 +1932,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           setResetTargetEmp(emp);
                           setResetNewPass('');
                         }}
-                        className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[40px]"
+                        className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[40px] whitespace-nowrap"
                       >
                         Password
                       </button>
                       <button
                         type="button"
                         onClick={() => handleToggleEmployeeActive(emp)}
-                        className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[40px]"
+                        className="rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[40px] whitespace-nowrap"
                       >
                         {emp.isActive ? 'Nonaktifkan' : 'Aktifkan'}
                       </button>
@@ -1432,7 +1947,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <button
                           type="button"
                           onClick={() => setDeleteBioTarget(emp)}
-                          className="rounded-xl border border-amber-300 px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-50 min-h-[40px]"
+                          className="rounded-xl border border-amber-300 px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-50 min-h-[40px] whitespace-nowrap"
                         >
                           Hapus Wajah
                         </button>
@@ -1454,15 +1969,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* SECTION 4: MONTHLY REPORT & GMAIL */}
+      {/* SECTION 4: MONTHLY REPORT (EXCEL .XLSX + GMAIL) */}
       {activeSection === 'MONTHLY_REPORT' && (
         <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-5">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-[#0F2942]">
-              <Mail className="w-5 h-5 shrink-0" />
-              <h2 className="text-base font-bold text-slate-900">
-                Rekap Bulanan
-              </h2>
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 text-[#0F2942]">
+                <FileSpreadsheet className="w-5 h-5 shrink-0" />
+                <h2 className="text-base font-bold text-slate-900">
+                  Rekap Bulanan Excel &amp; Pengiriman Email
+                </h2>
+              </div>
+              <p className="text-xs text-slate-600">
+                File Excel (.xlsx) mencakup 4 lembar kerja yang sinkron dengan Sanggah Absen.
+              </p>
             </div>
 
             <div className="grid grid-cols-1 sm:flex sm:flex-wrap items-center gap-2.5">
@@ -1474,8 +1994,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               />
               <button
                 type="button"
+                disabled={exportingExcel === 'monthly'}
+                onClick={handleExportMonthlyExcel}
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-xs font-bold text-white hover:bg-emerald-800 disabled:opacity-50 min-h-[44px] whitespace-nowrap"
+              >
+                <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                <span>
+                  {exportingExcel === 'monthly'
+                    ? 'Menyiapkan Excel...'
+                    : 'Unduh Excel (.xlsx)'}
+                </span>
+              </button>
+              <button
+                type="button"
                 onClick={handleConnectGmail}
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-xs font-semibold text-slate-800 hover:bg-slate-50 min-h-[44px]"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-xs font-semibold text-slate-800 hover:bg-slate-50 min-h-[44px] whitespace-nowrap"
               >
                 <Mail className="w-4 h-4 text-[#0F2942] shrink-0" />
                 <span className="truncate">
@@ -1496,10 +2029,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     triggerMode: 'MANUAL',
                   })
                 }
-                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px]"
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px] whitespace-nowrap"
               >
                 <Mail className="w-4 h-4 shrink-0" />
-                <span>Kirim Email</span>
+                <span>Kirim Email (.xlsx)</span>
               </button>
             </div>
           </div>
@@ -1508,14 +2041,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="space-y-4">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 border-y border-slate-100 py-2.5">
                 <span className="break-all">
-                  Tujuan:{' '}
+                  Tujuan Email:{' '}
                   <strong className="text-slate-900">
                     {monthlyReportData.adminReportEmail}
                   </strong>
                 </span>
                 <span aria-hidden="true">·</span>
                 <span>
-                  Status:{' '}
+                  Status Email:{' '}
                   <strong
                     className={
                       monthlyReportData.alreadySentForPeriod
@@ -1524,53 +2057,79 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     }
                   >
                     {monthlyReportData.alreadySentForPeriod
-                      ? 'Terkirim'
+                      ? 'Sudah Terkirim'
                       : 'Belum Dikirim'}
                   </strong>
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono tabular-nums">
+                  {monthlyReportData.totalRecordsInMonth || 0} log absensi &amp;{' '}
+                  {monthlyReportData.totalAppealsInMonth || 0} sanggah
                 </span>
               </div>
 
               <div className="md:hidden divide-y divide-slate-100">
                 {(monthlyReportData.rows || []).map((row: any) => (
-                  <div key={row.employeeId} className="py-3 space-y-1.5 text-xs">
+                  <div key={row.employeeId} className="py-3.5 space-y-2 text-xs">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-slate-900 truncate">
-                        {row.fullName}
-                      </span>
+                      <div className="min-w-0">
+                        <span className="font-bold text-slate-900 block truncate">
+                          {row.fullName}
+                        </span>
+                        <span className="text-[11px] text-slate-500">
+                          {row.position}
+                        </span>
+                      </div>
                       <span className="font-mono text-slate-500 shrink-0">
                         {row.employeeId}
                       </span>
                     </div>
-                    <div className="grid grid-cols-4 gap-2 text-center font-mono tabular-nums pt-1">
-                      <div className="rounded-lg bg-slate-50 p-2">
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 text-center font-mono tabular-nums pt-1">
+                      <div className="rounded-lg bg-slate-50 border border-slate-200/80 p-2">
                         <span className="block font-sans text-[10px] text-slate-500">
-                          Hadir
+                          Total Hadir
                         </span>
                         <strong className="text-slate-900">
                           {row.totalPresentDays}
                         </strong>
                       </div>
-                      <div className="rounded-lg bg-slate-50 p-2">
-                        <span className="block font-sans text-[10px] text-slate-500">
-                          Tepat
+                      <div className="rounded-lg bg-emerald-50/70 border border-emerald-200 p-2">
+                        <span className="block font-sans text-[10px] text-emerald-800">
+                          Tepat Waktu
                         </span>
-                        <strong className="text-emerald-700">
+                        <strong className="text-emerald-800">
                           {row.onTimeDays}
                         </strong>
                       </div>
-                      <div className="rounded-lg bg-slate-50 p-2">
-                        <span className="block font-sans text-[10px] text-slate-500">
-                          Telat
+                      <div className="rounded-lg bg-amber-50/70 border border-amber-200 p-2">
+                        <span className="block font-sans text-[10px] text-amber-800">
+                          Terlambat
                         </span>
-                        <strong className="text-amber-700">
+                        <strong className="text-amber-800">
                           {row.lateDays}
                         </strong>
                       </div>
-                      <div className="rounded-lg bg-slate-50 p-2">
+                      <div className="rounded-lg bg-amber-50/70 border border-amber-200 p-2">
+                        <span className="block font-sans text-[10px] text-amber-800">
+                          Pulang Cepat
+                        </span>
+                        <strong className="text-amber-800">
+                          {row.earlyLeaveDays || 0}
+                        </strong>
+                      </div>
+                      <div className="rounded-lg bg-sky-50/70 border border-sky-200 p-2">
+                        <span className="block font-sans text-[10px] text-sky-800">
+                          Via Sanggah
+                        </span>
+                        <strong className="text-sky-800">
+                          {row.approvedAppealDays || 0}
+                        </strong>
+                      </div>
+                      <div className="rounded-lg bg-slate-50 border border-slate-200/80 p-2">
                         <span className="block font-sans text-[10px] text-slate-500">
                           Pulang
                         </span>
-                        <strong className="text-slate-700">
+                        <strong className="text-slate-800">
                           {row.completedCheckOuts}
                         </strong>
                       </div>
@@ -1582,27 +2141,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <div className="hidden md:block overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
-                    <tr className="border-b border-slate-200 text-slate-500">
+                    <tr className="border-b border-slate-200 text-slate-600">
                       <th className="py-2.5 pr-3 font-semibold">ID</th>
                       <th className="py-2.5 pr-3 font-semibold">Nama</th>
                       <th className="py-2.5 pr-3 font-semibold">Jabatan</th>
                       <th className="py-2.5 pr-3 font-semibold text-right">
-                        Hadir
+                        Total Hadir
                       </th>
                       <th className="py-2.5 pr-3 font-semibold text-right">
-                        Tepat
+                        Tepat Waktu
                       </th>
                       <th className="py-2.5 pr-3 font-semibold text-right">
-                        Telat
+                        Terlambat
+                      </th>
+                      <th className="py-2.5 pr-3 font-semibold text-right">
+                        Pulang Cepat
+                      </th>
+                      <th className="py-2.5 pr-3 font-semibold text-right">
+                        Sanggah Disetujui
+                      </th>
+                      <th className="py-2.5 pr-3 font-semibold text-right">
+                        Sudah Pulang
                       </th>
                       <th className="py-2.5 font-semibold text-right">
-                        Pulang
+                        Menunggu
                       </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono tabular-nums">
                     {(monthlyReportData.rows || []).map((row: any) => (
-                      <tr key={row.employeeId}>
+                      <tr key={row.employeeId} className="hover:bg-slate-50/70">
                         <td className="py-2.5 pr-3 text-slate-700">
                           {row.employeeId}
                         </td>
@@ -1615,14 +2183,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         <td className="py-2.5 pr-3 text-right font-bold text-slate-900">
                           {row.totalPresentDays}
                         </td>
-                        <td className="py-2.5 pr-3 text-right text-emerald-700">
+                        <td className="py-2.5 pr-3 text-right text-emerald-700 font-semibold">
                           {row.onTimeDays}
                         </td>
-                        <td className="py-2.5 pr-3 text-right text-amber-700">
+                        <td className="py-2.5 pr-3 text-right text-amber-700 font-semibold">
                           {row.lateDays}
                         </td>
-                        <td className="py-2.5 text-right text-slate-700">
+                        <td className="py-2.5 pr-3 text-right text-amber-700">
+                          {row.earlyLeaveDays || 0}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right text-sky-700 font-semibold">
+                          {row.approvedAppealDays || 0}
+                        </td>
+                        <td className="py-2.5 pr-3 text-right text-slate-700">
                           {row.completedCheckOuts}
+                        </td>
+                        <td className="py-2.5 text-right text-slate-600">
+                          {row.pendingDays || 0}
                         </td>
                       </tr>
                     ))}
@@ -1652,7 +2229,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 <button
                   type="button"
                   onClick={handleUseCurrentGpsForOffice}
-                  className="w-full sm:w-auto rounded-xl border border-[#0F2942] px-3.5 py-2 text-xs font-semibold text-[#0F2942] hover:bg-slate-50 min-h-[44px]"
+                  className="w-full sm:w-auto rounded-xl border border-[#0F2942] px-3.5 py-2 text-xs font-semibold text-[#0F2942] hover:bg-slate-50 min-h-[44px] whitespace-nowrap"
                 >
                   Titik GPS Saat Ini
                 </button>
@@ -1870,7 +2447,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       className="w-4 h-4 rounded border-slate-300"
                     />
                     <span className="font-medium text-slate-800">
-                      Email Otomatis Akhir Bulan
+                      Email Excel Otomatis Akhir Bulan
                     </span>
                   </label>
                 </div>
@@ -1967,7 +2544,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
           {auditLogs.length > 0 && (
             <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-3">
-              <h2 className="text-base font-bold text-slate-900">Log Aktivitas</h2>
+              <h2 className="text-base font-bold text-slate-900">
+                Log Aktivitas
+              </h2>
               <div className="divide-y divide-slate-100 max-h-80 overflow-y-auto">
                 {auditLogs.slice(0, 30).map((log) => (
                   <div key={log.logId} className="py-2.5 text-xs space-y-0.5">
@@ -1975,7 +2554,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       <span className="font-mono font-bold text-[#0F2942] truncate">
                         {log.action}
                       </span>
-                      <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                      <span className="font-mono text-[11px] text-slate-500 shrink-0 tabular-nums">
                         {formatWibDateTime(log.timestampIso)}
                       </span>
                     </div>
@@ -2015,13 +2594,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             <div className="text-xs text-slate-700 space-y-1 bg-slate-50 p-3 rounded-xl border border-slate-200">
               <p className="font-bold text-slate-900">
                 {appealReviewModal.appeal.employeeName} ·{' '}
-                {appealReviewModal.appeal.workDateWib} (
+                {formatWibDateLong(appealReviewModal.appeal.workDateWib)} (
                 {formatScopeLabel(appealReviewModal.appeal.scope)})
               </p>
               <p>
-                {appealReviewModal.appeal.category}:{' '}
+                <strong>{appealReviewModal.appeal.category}:</strong>{' '}
                 {appealReviewModal.appeal.reason}
               </p>
+              {appealReviewModal.decision === 'APPROVE' && (
+                <p className="text-[11px] text-emerald-800 pt-1">
+                  Menyetujui sanggah akan otomatis mencatat/mengubah absensi karyawan menjadi Valid pada Rekap Harian &amp; Excel.
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs font-semibold text-slate-700 block mb-1">
@@ -2061,7 +2645,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 {processingAppeal
                   ? 'Memproses...'
                   : appealReviewModal.decision === 'APPROVE'
-                  ? 'Setujui'
+                  ? 'Setujui & Sinkron'
                   : 'Tolak'}
               </button>
             </div>
@@ -2075,7 +2659,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="w-full max-w-md max-h-[92dvh] overflow-y-auto rounded-t-3xl sm:rounded-2xl bg-white border border-slate-200 p-5 sm:p-6 pb-safe space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-bold text-slate-900">
-                Detail Absensi
+                Detail Transaksi Absensi
               </h3>
               <button
                 type="button"
@@ -2088,7 +2672,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
             {evidenceModal.loading ? (
               <p className="text-xs text-slate-500 py-6 text-center">
-                Memuat...
+                Memuat bukti...
               </p>
             ) : evidenceModal.thumbnailDataUrl ? (
               <img
@@ -2099,19 +2683,30 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               />
             ) : null}
 
-            <div className="space-y-1.5 text-xs text-slate-700 font-mono tabular-nums break-words">
-              <p className="font-sans font-bold text-slate-900">
+            <div className="space-y-1.5 text-xs text-slate-700 font-mono tabular-nums break-words bg-slate-50 rounded-xl border border-slate-200 p-3.5">
+              <p className="font-sans font-bold text-sm text-slate-900">
                 {evidenceModal.record.employeeName} (
                 {evidenceModal.record.employeeId})
               </p>
+              <p className="font-sans font-semibold text-slate-700">
+                {evidenceModal.record.type === 'CHECK_IN'
+                  ? 'Absen Masuk'
+                  : 'Absen Pulang'}{' '}
+                · {formatWibDateLong(evidenceModal.record.workDateWib)} ·{' '}
+                {formatWibHourMinute(
+                  evidenceModal.record.serverTimestampIso ||
+                    evidenceModal.record.deviceTimestampIso
+                )}
+              </p>
               <p>
                 GPS: {evidenceModal.record.latitude},{' '}
-                {evidenceModal.record.longitude}
+                {evidenceModal.record.longitude} (
+                {evidenceModal.record.distanceToOfficeMeters}m dari kantor)
               </p>
               <p className="font-sans">{evidenceModal.record.livenessDetail}</p>
               {evidenceModal.record.reviewedBy && (
-                <p className="font-sans text-emerald-800 pt-1">
-                  Admin ({evidenceModal.record.reviewedBy}):{' '}
+                <p className="font-sans text-emerald-800 font-medium pt-1">
+                  Keputusan Admin ({evidenceModal.record.reviewedBy}):{' '}
                   {evidenceModal.record.reviewNote}
                 </p>
               )}
@@ -2134,7 +2729,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </h3>
             <p className="text-xs text-slate-600">
               <strong>{reviewModal.record.employeeName}</strong> ·{' '}
-              {reviewModal.record.workDateWib}
+              {formatWibDateLong(reviewModal.record.workDateWib)}
             </p>
             {reviewModal.decision !== 'REJECT' && (
               <div className="grid grid-cols-2 gap-2 text-xs">
@@ -2244,7 +2839,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               Hapus Data Wajah?
             </h3>
             <p className="text-xs text-slate-600">
-              Data wajah <strong>{deleteBioTarget.fullName}</strong> akan dihapus.
+              Data wajah <strong>{deleteBioTarget.fullName}</strong> akan dihapus. Karyawan dapat merekam ulang wajah dari akunnya atau melalui Admin.
             </p>
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -2297,13 +2892,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* MODAL 8: Send Monthly Email */}
+      {/* MODAL 8: Send Monthly Email (.xlsx) */}
       {confirmEmailModal && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-slate-950/70 p-0 sm:p-4">
           <div className="w-full max-w-md rounded-t-3xl sm:rounded-2xl bg-white border border-slate-200 p-5 sm:p-6 pb-safe space-y-4">
             <h3 className="text-base font-bold text-slate-900">
-              Kirim Laporan {confirmEmailModal.period}
+              Kirim Rekap Excel ({confirmEmailModal.period})
             </h3>
+            <p className="text-xs text-slate-600">
+              Lampiran <strong>Rekap-Absensi-{confirmEmailModal.period}.xlsx</strong> (4 lembar: Rekap Harian, Ringkasan Karyawan, Data Sanggah, Log Detail) akan dikirim ke alamat berikut:
+            </p>
             <input
               type="email"
               value={confirmEmailModal.recipientEmail}
@@ -2330,7 +2928,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 onClick={handleConfirmSendMonthlyEmail}
                 className="rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#163A5C] min-h-[44px]"
               >
-                {sendingEmail ? 'Mengirim...' : 'Kirim'}
+                {sendingEmail ? 'Mengirim...' : 'Kirim Excel'}
               </button>
             </div>
           </div>

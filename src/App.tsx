@@ -7,7 +7,7 @@ import {
   ClipboardList,
   Users,
   FileText,
-  Mail,
+  FileSpreadsheet,
   Settings,
 } from 'lucide-react';
 import type { AuthSessionUser, OfficeSettings } from './types/attendance';
@@ -314,7 +314,7 @@ export default function App() {
     { id: 'OVERVIEW', label: 'Absensi', icon: ClipboardList },
     { id: 'APPEALS', label: 'Sanggah', icon: FileText },
     { id: 'EMPLOYEES', label: 'Karyawan', icon: Users },
-    { id: 'MONTHLY_REPORT', label: 'Email', icon: Mail },
+    { id: 'MONTHLY_REPORT', label: 'Rekap', icon: FileSpreadsheet },
     { id: 'SETTINGS_AUDIT', label: 'Kantor', icon: Settings },
   ];
 
@@ -387,6 +387,14 @@ export default function App() {
             isOnline={isOnline}
             onConsentAccepted={() => {
               const updated = { ...user, consentAccepted: true };
+              setUser(updated);
+              localStorage.setItem(
+                SESSION_USER_CACHE_KEY,
+                JSON.stringify(updated)
+              );
+            }}
+            onFaceRegistered={() => {
+              const updated = { ...user, hasFaceProfile: true };
               setUser(updated);
               localStorage.setItem(
                 SESSION_USER_CACHE_KEY,

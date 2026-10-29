@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { adminAuth, adminDb } from './src/lib/firebase-admin.ts';
 import {
+  buildScheduledWibIso,
   calculateGeodesicDistanceMeters,
   cosineSimilarity,
   getWibParts,
@@ -13,6 +14,11 @@ import {
   resolveWorkDateWib,
   formatWibDateTime,
 } from './src/utils/geoAndTime.ts';
+import { buildDailyAttendanceEntries } from './src/utils/attendanceSyncView.ts';
+import {
+  buildAttendanceExcelBuffer,
+  computeSummaryRows,
+} from './src/services/excelReportBuilder.ts';
 import type {
   AppealScope,
   AttendanceAppeal,
@@ -138,6 +144,266 @@ async function writeAuditLog(entry: Omit<AuditLogRecord, 'logId' | 'timestampIso
     timestampIso: new Date().toISOString(),
   };
   await adminDb.collection('audit_logs').doc(logId).set(record);
+}
+
+/**
+ * Bidirectionally synchronizes an AttendanceAppeal (PENDING / APPROVED / REJECTED)
+ * with attendance_records on workDateWib so Sanggah and Absensi are always 100% consistent.
+ */
+async function syncAppealToAttendanceRecords(
+  appeal: AttendanceAppeal,
+  settings: OfficeSettings
+): Promise<void> {
+  const daySnap = await adminDb
+    .collection('attendance_records')
+    .where('employeeId', '==', appeal.employeeId)
+    .where('workDateWib', '==', appeal.workDateWib)
+    .get();
+
+  const docsOnDay: { id: string; data: AttendanceRecord }[] = [];
+  daySnap.forEach((d) => {
+    docsOnDay.push({ id: d.id, data: d.data() as AttendanceRecord });
+  });
+
+  const targetTypes: ('CHECK_IN' | 'CHECK_OUT')[] =
+    appeal.scope === 'CHECK_IN'
+      ? ['CHECK_IN']
+      : appeal.scope === 'CHECK_OUT'
+      ? ['CHECK_OUT']
+      : ['CHECK_IN', 'CHECK_OUT'];
+
+  const lat =
+    typeof appeal.latitude === 'number' ? appeal.latitude : settings.latitude;
+  const lng =
+    typeof appeal.longitude === 'number' ? appeal.longitude : settings.longitude;
+  const dist =
+    typeof appeal.latitude === 'number' && typeof appeal.longitude === 'number'
+      ? calculateGeodesicDistanceMeters(
+          appeal.latitude,
+          appeal.longitude,
+          settings.latitude,
+          settings.longitude
+        )
+      : 0;
+
+  const detailText = `Sanggah (${appeal.category}): ${appeal.reason}`.slice(0, 190);
+  const reviewer = (appeal.reviewedBy || 'admin').slice(0, 80);
+  const revNote = (
+    appeal.reviewNote ||
+    (appeal.status === 'APPROVED'
+      ? 'Sanggah disetujui Admin'
+      : appeal.status === 'REJECTED'
+      ? 'Sanggah ditolak Admin'
+      : '')
+  ).slice(0, 280);
+  const revAtIso = appeal.reviewedAtIso || new Date().toISOString();
+
+  for (const t of targetTypes) {
+    const scheduledIso = buildScheduledWibIso(
+      appeal.workDateWib,
+      t === 'CHECK_IN' ? settings.workStartTime : settings.workEndTime
+    );
+    const txIdForAppeal = `att_${appeal.appealId}_${t === 'CHECK_IN' ? 'IN' : 'OUT'}`;
+
+    const ofType = docsOnDay.filter((x) => x.data.type === t);
+    const appealSpecific = ofType.find(
+      (x) => x.id === txIdForAppeal || x.data.appealId === appeal.appealId
+    );
+    const biometricDoc = ofType.find(
+      (x) =>
+        !x.data.appealId &&
+        !x.id.startsWith('att_apl_') &&
+        !x.data.livenessDetail.startsWith('Sanggah') &&
+        (x.data.attendanceStatus === 'VALID' ||
+          x.data.attendanceStatus === 'LATE' ||
+          x.data.attendanceStatus === 'EARLY_LEAVE')
+    );
+    const fallbackDoc = ofType.find(
+      (x) =>
+        x.data.attendanceStatus === 'NEEDS_REVIEW' ||
+        x.data.attendanceStatus === 'REJECTED'
+    );
+
+    if (appeal.status === 'PENDING') {
+      if (biometricDoc) {
+        if (
+          biometricDoc.data.attendanceStatus === 'LATE' ||
+          biometricDoc.data.attendanceStatus === 'EARLY_LEAVE'
+        ) {
+          await adminDb.collection('attendance_records').doc(biometricDoc.id).update({
+            appealId: appeal.appealId,
+            appealStatus: 'PENDING',
+            appealCategory: appeal.category.slice(0, 80),
+          });
+        }
+      } else if (appealSpecific || fallbackDoc) {
+        const target = (appealSpecific || fallbackDoc)!;
+        await adminDb.collection('attendance_records').doc(target.id).update({
+          attendanceStatus: 'NEEDS_REVIEW',
+          syncStatus: 'NEEDS_ADMIN_REVIEW',
+          livenessDetail: detailText,
+          rejectionReason: `Menunggu persetujuan sanggah (${appeal.category})`.slice(0, 280),
+          appealId: appeal.appealId,
+          appealStatus: 'PENDING',
+          appealCategory: appeal.category.slice(0, 80),
+        });
+      } else {
+        const pendingRec: AttendanceRecord = {
+          transactionId: txIdForAppeal,
+          employeeId: appeal.employeeId,
+          employeeName: appeal.employeeName,
+          type: t,
+          workDateWib: appeal.workDateWib,
+          serverTimestampIso: scheduledIso,
+          deviceTimestampIso: appeal.createdAtIso,
+          gpsTimestampIso: appeal.createdAtIso,
+          latitude: lat,
+          longitude: lng,
+          gpsAccuracyMeters: 0,
+          distanceToOfficeMeters: dist,
+          geofenceValid: true,
+          suspiciousLocationFlags: [],
+          faceMatchScore: 1,
+          faceVerified: true,
+          livenessVerified: true,
+          livenessDetail: detailText,
+          attendanceStatus: 'NEEDS_REVIEW',
+          syncStatus: 'NEEDS_ADMIN_REVIEW',
+          wasCapturedOffline: false,
+          clockSkewSeconds: 0,
+          rejectionReason: `Menunggu persetujuan sanggah (${appeal.category})`.slice(0, 280),
+          hasEvidence: false,
+          appealId: appeal.appealId,
+          appealStatus: 'PENDING',
+          appealCategory: appeal.category.slice(0, 80),
+        };
+        await adminDb.collection('attendance_records').doc(txIdForAppeal).createIfAbsent(pendingRec);
+      }
+    } else if (appeal.status === 'APPROVED') {
+      if (biometricDoc) {
+        if (biometricDoc.data.attendanceStatus !== 'VALID' || biometricDoc.data.appealStatus !== 'APPROVED') {
+          await adminDb.collection('attendance_records').doc(biometricDoc.id).update({
+            attendanceStatus: 'VALID',
+            syncStatus: 'SYNCED',
+            geofenceValid: true,
+            faceVerified: true,
+            livenessVerified: true,
+            livenessDetail: detailText,
+            reviewedBy: reviewer,
+            reviewNote: revNote,
+            reviewedAtIso: revAtIso,
+            rejectionReason: '',
+            appealId: appeal.appealId,
+            appealStatus: 'APPROVED',
+            appealCategory: appeal.category.slice(0, 80),
+          });
+        }
+      } else if (appealSpecific || fallbackDoc) {
+        const target = (appealSpecific || fallbackDoc)!;
+        await adminDb.collection('attendance_records').doc(target.id).update({
+          attendanceStatus: 'VALID',
+          syncStatus: 'SYNCED',
+          geofenceValid: true,
+          faceVerified: true,
+          livenessVerified: true,
+          livenessDetail: detailText,
+          reviewedBy: reviewer,
+          reviewNote: revNote,
+          reviewedAtIso: revAtIso,
+          rejectionReason: '',
+          serverTimestampIso: scheduledIso,
+          appealId: appeal.appealId,
+          appealStatus: 'APPROVED',
+          appealCategory: appeal.category.slice(0, 80),
+        });
+      } else {
+        const validRec: AttendanceRecord = {
+          transactionId: txIdForAppeal,
+          employeeId: appeal.employeeId,
+          employeeName: appeal.employeeName,
+          type: t,
+          workDateWib: appeal.workDateWib,
+          serverTimestampIso: scheduledIso,
+          deviceTimestampIso: appeal.createdAtIso,
+          gpsTimestampIso: appeal.createdAtIso,
+          latitude: lat,
+          longitude: lng,
+          gpsAccuracyMeters: 0,
+          distanceToOfficeMeters: dist,
+          geofenceValid: true,
+          suspiciousLocationFlags: [],
+          faceMatchScore: 1,
+          faceVerified: true,
+          livenessVerified: true,
+          livenessDetail: detailText,
+          attendanceStatus: 'VALID',
+          syncStatus: 'SYNCED',
+          wasCapturedOffline: false,
+          clockSkewSeconds: 0,
+          rejectionReason: '',
+          reviewedBy: reviewer,
+          reviewNote: revNote,
+          reviewedAtIso: revAtIso,
+          hasEvidence: false,
+          appealId: appeal.appealId,
+          appealStatus: 'APPROVED',
+          appealCategory: appeal.category.slice(0, 80),
+        };
+        await adminDb.collection('attendance_records').doc(txIdForAppeal).createIfAbsent(validRec);
+      }
+    } else if (appeal.status === 'REJECTED') {
+      if (biometricDoc) {
+        await adminDb.collection('attendance_records').doc(biometricDoc.id).update({
+          reviewedBy: reviewer,
+          reviewNote: revNote,
+          reviewedAtIso: revAtIso,
+          appealId: appeal.appealId,
+          appealStatus: 'REJECTED',
+          appealCategory: appeal.category.slice(0, 80),
+        });
+      } else if (appealSpecific) {
+        await adminDb.collection('attendance_records').doc(appealSpecific.id).update({
+          attendanceStatus: 'REJECTED',
+          syncStatus: 'REJECTED_SERVER',
+          reviewedBy: reviewer,
+          reviewNote: revNote,
+          reviewedAtIso: revAtIso,
+          rejectionReason: `Sanggah ditolak: ${revNote}`.slice(0, 280),
+          appealId: appeal.appealId,
+          appealStatus: 'REJECTED',
+          appealCategory: appeal.category.slice(0, 80),
+        });
+      }
+    }
+  }
+}
+
+async function reconcileUnsyncedAppeals(
+  appeals: AttendanceAppeal[],
+  records: AttendanceRecord[],
+  settings: OfficeSettings
+): Promise<boolean> {
+  let didMutate = false;
+  for (const apl of appeals) {
+    const linked = records.filter(
+      (r) =>
+        r.appealId === apl.appealId ||
+        r.transactionId.startsWith(`att_${apl.appealId}_`)
+    );
+    const expectedCount = apl.scope === 'FULL_DAY' ? 2 : 1;
+    const statusMismatch = linked.some((r) => r.appealStatus !== apl.status);
+    if (
+      (apl.status === 'PENDING' || apl.status === 'APPROVED') &&
+      (linked.length < expectedCount || statusMismatch)
+    ) {
+      await syncAppealToAttendanceRecords(apl, settings);
+      didMutate = true;
+    } else if (apl.status === 'REJECTED' && statusMismatch) {
+      await syncAppealToAttendanceRecords(apl, settings);
+      didMutate = true;
+    }
+  }
+  return didMutate;
 }
 
 // Middleware supporting both JWT (username/password) and Firebase ID Token (Google Admin)
@@ -996,7 +1262,7 @@ export function createApiApp(): express.Express {
         }
         if (sampleCount < 3) {
           res.status(400).json({
-            error: 'Registrasi wajah wajib mengambil minimal 3 sampel sudut/pencahayaan langsung.',
+            error: 'Registrasi wajah wajib mengambil minimal 3 sampel pencahayaan langsung.',
           });
           return;
         }
@@ -1009,15 +1275,28 @@ export function createApiApp(): express.Express {
         }
 
         const nowIso = new Date().toISOString();
-        await adminDb.collection('face_profiles').doc(employeeId).set({
-          employeeId,
-          descriptorVector,
-          sampleCount,
-          qualityScore,
-          encryptionVersion: 'L2-NORM-128D-V1',
-          updatedAtIso: nowIso,
-          registeredBy: s.username,
-        });
+        const faceRef = adminDb.collection('face_profiles').doc(employeeId);
+        const existingFace = await faceRef.get();
+        if (existingFace.exists) {
+          await faceRef.update({
+            descriptorVector,
+            sampleCount,
+            qualityScore,
+            encryptionVersion: 'L2-NORM-128D-V1',
+            updatedAtIso: nowIso,
+            registeredBy: s.username,
+          });
+        } else {
+          await faceRef.set({
+            employeeId,
+            descriptorVector,
+            sampleCount,
+            qualityScore,
+            encryptionVersion: 'L2-NORM-128D-V1',
+            updatedAtIso: nowIso,
+            registeredBy: s.username,
+          });
+        }
 
         await empRef.update({
           hasFaceProfile: true,
@@ -1036,6 +1315,99 @@ export function createApiApp(): express.Express {
       } catch (err) {
         console.error('Register face error:', err);
         res.status(500).json({ error: 'Gagal menyimpan data referensi wajah karyawan.' });
+      }
+    }
+  );
+
+  // 8b. Employee Self-Service: Record / Update Own Face Reference Profile from Employee Account
+  app.post(
+    '/api/employee/face-profile',
+    requireSession,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const s = req.sessionUser!;
+        if (s.role !== 'EMPLOYEE') {
+          res.status(403).json({ error: 'Khusus akun Karyawan.' });
+          return;
+        }
+
+        const descriptorVector = req.body?.descriptorVector;
+        const sampleCount = Number(req.body?.sampleCount || 0);
+        const qualityScore = Number(req.body?.qualityScore || 0);
+
+        if (
+          !Array.isArray(descriptorVector) ||
+          descriptorVector.length !== 128 ||
+          !descriptorVector.every((v) => typeof v === 'number' && Number.isFinite(v))
+        ) {
+          res.status(400).json({
+            error: 'Data rekam wajah tidak valid. Ulangi pemindaian wajah.',
+          });
+          return;
+        }
+        if (sampleCount < 3) {
+          res.status(400).json({
+            error: 'Rekam wajah memerlukan minimal 3 sampel wajah yang jelas.',
+          });
+          return;
+        }
+
+        const empRef = adminDb.collection('employees').doc(s.employeeId);
+        const empSnap = await empRef.get();
+        if (!empSnap.exists || empSnap.data()?.isActive === false) {
+          res.status(403).json({ error: 'Akun karyawan tidak aktif.' });
+          return;
+        }
+
+        const settingsSnap = await adminDb.collection('office_settings').doc('main').get();
+        const settings = (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+
+        const nowIso = new Date().toISOString();
+        const faceRef = adminDb.collection('face_profiles').doc(s.employeeId);
+        const existingFace = await faceRef.get();
+
+        if (existingFace.exists) {
+          await faceRef.update({
+            descriptorVector,
+            sampleCount,
+            qualityScore,
+            encryptionVersion: 'L2-NORM-128D-V1',
+            updatedAtIso: nowIso,
+            registeredBy: s.username,
+          });
+        } else {
+          await faceRef.set({
+            employeeId: s.employeeId,
+            descriptorVector,
+            sampleCount,
+            qualityScore,
+            encryptionVersion: 'L2-NORM-128D-V1',
+            updatedAtIso: nowIso,
+            registeredBy: s.username,
+          });
+        }
+
+        await empRef.update({
+          hasFaceProfile: true,
+        });
+
+        await writeAuditLog({
+          actorUsername: s.username,
+          actorRole: s.role,
+          action: 'SELF_REGISTER_FACE_PROFILE',
+          targetId: s.employeeId,
+          newValueSummary: `${sampleCount} sampel wajah mandiri, skor kualitas ${qualityScore}/100`,
+          reason: 'Perekaman referensi wajah mandiri dari akun karyawan',
+        });
+
+        res.json({
+          ok: true,
+          updatedAtIso: nowIso,
+          threshold: settings.faceMatchThreshold,
+        });
+      } catch (err) {
+        console.error('Employee self face enroll error:', err);
+        res.status(500).json({ error: 'Gagal menyimpan rekaman wajah Anda.' });
       }
     }
   );
@@ -1084,7 +1456,7 @@ export function createApiApp(): express.Express {
         const faceSnap = await adminDb.collection('face_profiles').doc(s.employeeId).get();
         if (!faceSnap.exists) {
           res.status(400).json({
-            error: 'Data referensi wajah Anda belum didaftarkan oleh Admin. Hubungi Admin.',
+            error: 'Wajah Anda belum direkam. Silakan klik tombol Rekam Wajah pada halaman Absen terlebih dahulu.',
           });
           return;
         }
@@ -1202,12 +1574,14 @@ export function createApiApp(): express.Express {
             r.type === 'CHECK_IN' &&
             (r.attendanceStatus === 'VALID' ||
               r.attendanceStatus === 'LATE' ||
-              r.attendanceStatus === 'NEEDS_REVIEW')
+              (r.attendanceStatus === 'NEEDS_REVIEW' && !r.appealId))
         );
         const existingValidCheckOut = dayRecords.find(
           (r) =>
             r.type === 'CHECK_OUT' &&
-            (r.attendanceStatus === 'VALID' || r.attendanceStatus === 'NEEDS_REVIEW')
+            (r.attendanceStatus === 'VALID' ||
+              r.attendanceStatus === 'EARLY_LEAVE' ||
+              (r.attendanceStatus === 'NEEDS_REVIEW' && !r.appealId))
         );
 
         let attendanceStatus: AttendanceRecord['attendanceStatus'] = 'VALID';
@@ -1253,8 +1627,6 @@ export function createApiApp(): express.Express {
           syncStatus = 'REJECTED_SERVER';
           rejectionReason = `Anda sudah melakukan Absen Pulang pada tanggal kerja ${workDateWib}.`;
         } else if (wasCapturedOffline || borderlineMatch || suspiciousFlags.length > 0) {
-          // Offline records & borderline biometric/GPS flags are NEVER silently marked VALID:
-          // They are placed in NEEDS_REVIEW / NEEDS_ADMIN_REVIEW per offline security policy!
           attendanceStatus = 'NEEDS_REVIEW';
           syncStatus = 'NEEDS_ADMIN_REVIEW';
           const reasons: string[] = [];
@@ -1271,18 +1643,26 @@ export function createApiApp(): express.Express {
           }
           rejectionReason = reasons.join(' | ');
         } else {
-          // Valid online attendance: evaluate on-time vs LATE for CHECK_IN
+          // Valid online attendance: evaluate LATE for CHECK_IN and EARLY_LEAVE for CHECK_OUT
+          const wibNow = getWibParts(nowServer);
+          const nowMins = wibNow.hour * 60 + wibNow.minute;
+          const startMins = parseHhMmToMinutes(settings.workStartTime);
+          const endMins = parseHhMmToMinutes(settings.workEndTime);
+
           if (type === 'CHECK_IN') {
-            const wibNow = getWibParts(nowServer);
-            const nowMins = wibNow.hour * 60 + wibNow.minute;
-            const startMins = parseHhMmToMinutes(settings.workStartTime);
             if (nowMins > startMins + settings.lateToleranceMinutes) {
               attendanceStatus = 'LATE';
             } else {
               attendanceStatus = 'VALID';
             }
           } else {
-            attendanceStatus = 'VALID';
+            const isEarlyLeave =
+              settings.enableNightShift && endMins < startMins
+                ? nowMins >= startMins
+                  ? true
+                  : nowMins < endMins
+                : nowMins < endMins;
+            attendanceStatus = isEarlyLeave ? 'EARLY_LEAVE' : 'VALID';
           }
           syncStatus = 'SYNCED';
         }
@@ -1374,27 +1754,64 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // 10. Employee: Get ONLY Own Attendance History (Strict RBAC isolation)
+  // 10. Employee: Get ONLY Own Synchronized Attendance & Sanggah History
   app.get(
     '/api/attendance/my-history',
     requireSession,
     async (req: AuthenticatedRequest, res: Response) => {
       try {
         const s = req.sessionUser!;
-        const snap = await adminDb
-          .collection('attendance_records')
-          .where('employeeId', '==', s.employeeId)
-          .get();
+        const [attSnap, aplSnap, empSnap, settingsSnap] = await Promise.all([
+          adminDb
+            .collection('attendance_records')
+            .where('employeeId', '==', s.employeeId)
+            .get(),
+          adminDb
+            .collection('attendance_appeals')
+            .where('employeeId', '==', s.employeeId)
+            .get(),
+          adminDb.collection('employees').doc(s.employeeId).get(),
+          adminDb.collection('office_settings').doc('main').get(),
+        ]);
 
-        const records: AttendanceRecord[] = [];
-        snap.forEach((doc) => records.push(doc.data() as AttendanceRecord));
+        const settings =
+          (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+        let records: AttendanceRecord[] = [];
+        attSnap.forEach((doc) => records.push(doc.data() as AttendanceRecord));
+
+        const appeals: AttendanceAppeal[] = [];
+        aplSnap.forEach((doc) => appeals.push(doc.data() as AttendanceAppeal));
+
+        const didReconcile = await reconcileUnsyncedAppeals(appeals, records, settings);
+        if (didReconcile) {
+          const refreshedSnap = await adminDb
+            .collection('attendance_records')
+            .where('employeeId', '==', s.employeeId)
+            .get();
+          records = [];
+          refreshedSnap.forEach((doc) => records.push(doc.data() as AttendanceRecord));
+        }
+
         records.sort((a, b) =>
           (b.serverTimestampIso || b.deviceTimestampIso).localeCompare(
             a.serverTimestampIso || a.deviceTimestampIso
           )
         );
+        appeals.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
 
-        res.json({ records: records.slice(0, 90) });
+        const empList = empSnap.exists ? [empSnap.data() as EmployeeProfile] : [];
+        const dailyEntries = buildDailyAttendanceEntries({
+          records,
+          appeals,
+          employees: empList,
+          officeSettings: settings,
+        });
+
+        res.json({
+          records: records.slice(0, 120),
+          appeals: appeals.slice(0, 60),
+          dailyEntries: dailyEntries.slice(0, 60),
+        });
       } catch (err) {
         console.error('My history error:', err);
         res.status(500).json({ error: 'Gagal memuat riwayat absensi Anda.' });
@@ -1402,7 +1819,7 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // 10b. Employee: Submit Sanggah Absen (Field Duty / Attendance Exception)
+  // 10b. Employee: Submit Sanggah Absen (Field Duty / Late / Early Leave / Missing Checkout)
   app.post(
     '/api/appeals',
     requireSession,
@@ -1443,11 +1860,16 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        // Prevent duplicate pending appeal on same date & scope
-        const existingSnap = await adminDb
-          .collection('attendance_appeals')
-          .where('employeeId', '==', s.employeeId)
-          .get();
+        const [existingSnap, settingsSnap] = await Promise.all([
+          adminDb
+            .collection('attendance_appeals')
+            .where('employeeId', '==', s.employeeId)
+            .get(),
+          adminDb.collection('office_settings').doc('main').get(),
+        ]);
+        const settings =
+          (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+
         const duplicatePending = existingSnap.docs.some((d) => {
           const a = d.data() as AttendanceAppeal;
           return (
@@ -1466,7 +1888,7 @@ export function createApiApp(): express.Express {
         const appealId = `apl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const createdAtIso = new Date().toISOString();
 
-        const appealDoc: Record<string, any> = {
+        const appealDoc: AttendanceAppeal = {
           appealId,
           employeeId: s.employeeId,
           employeeName: empData.fullName || s.fullName,
@@ -1493,6 +1915,9 @@ export function createApiApp(): express.Express {
         }
 
         await adminDb.collection('attendance_appeals').doc(appealId).set(appealDoc);
+
+        // Immediately synchronize pending Sanggah into attendance_records!
+        await syncAppealToAttendanceRecords(appealDoc, settings);
 
         await writeAuditLog({
           actorUsername: s.username,
@@ -1555,7 +1980,7 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // 10e. Admin: Approve or Reject Sanggah Absen (Auto-records valid attendance on approval)
+  // 10e. Admin: Approve or Reject Sanggah Absen (Synchronizes attendance_records in both cases)
   app.post(
     '/api/admin/appeals/:appealId/review',
     requireSession,
@@ -1570,135 +1995,43 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        const appealRef = adminDb.collection('attendance_appeals').doc(appealId);
-        const appealSnap = await appealRef.get();
+        const [appealSnap, settingsSnap] = await Promise.all([
+          adminDb.collection('attendance_appeals').doc(appealId).get(),
+          adminDb.collection('office_settings').doc('main').get(),
+        ]);
+
         if (!appealSnap.exists) {
           res.status(404).json({ error: 'Data sanggah tidak ditemukan.' });
           return;
         }
 
+        const settings =
+          (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
         const appeal = appealSnap.data() as AttendanceAppeal;
         const nowIso = new Date().toISOString();
         const rawNote = String(req.body?.reviewNote || '').trim();
         const reviewNote = (
           rawNote || (decision === 'APPROVE' ? 'Disetujui Admin' : 'Ditolak Admin')
         ).slice(0, 280);
-        const nextStatus = decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
+        const nextStatus: AttendanceAppeal['status'] =
+          decision === 'APPROVE' ? 'APPROVED' : 'REJECTED';
 
-        await appealRef.update({
+        await adminDb.collection('attendance_appeals').doc(appealId).update({
           status: nextStatus,
           reviewedBy: s.username,
           reviewNote,
           reviewedAtIso: nowIso,
         });
 
-        if (decision === 'APPROVE') {
-          const settingsSnap = await adminDb.collection('office_settings').doc('main').get();
-          const settings =
-            (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+        const updatedAppeal: AttendanceAppeal = {
+          ...appeal,
+          status: nextStatus,
+          reviewedBy: s.username,
+          reviewNote,
+          reviewedAtIso: nowIso,
+        };
 
-          const daySnap = await adminDb
-            .collection('attendance_records')
-            .where('employeeId', '==', appeal.employeeId)
-            .where('workDateWib', '==', appeal.workDateWib)
-            .get();
-
-          const existingByType = new Map<string, { id: string; data: AttendanceRecord }>();
-          daySnap.forEach((doc) => {
-            const d = doc.data() as AttendanceRecord;
-            const prev = existingByType.get(d.type);
-            if (
-              !prev ||
-              d.attendanceStatus === 'VALID' ||
-              d.attendanceStatus === 'LATE'
-            ) {
-              existingByType.set(d.type, { id: doc.id, data: d });
-            }
-          });
-
-          const targetTypes: ('CHECK_IN' | 'CHECK_OUT')[] =
-            appeal.scope === 'CHECK_IN'
-              ? ['CHECK_IN']
-              : appeal.scope === 'CHECK_OUT'
-              ? ['CHECK_OUT']
-              : ['CHECK_IN', 'CHECK_OUT'];
-
-          const lat =
-            typeof appeal.latitude === 'number' ? appeal.latitude : settings.latitude;
-          const lng =
-            typeof appeal.longitude === 'number' ? appeal.longitude : settings.longitude;
-          const dist =
-            typeof appeal.latitude === 'number' && typeof appeal.longitude === 'number'
-              ? calculateGeodesicDistanceMeters(
-                  appeal.latitude,
-                  appeal.longitude,
-                  settings.latitude,
-                  settings.longitude
-                )
-              : 0;
-          const detailText = `Sanggah (${appeal.category}): ${appeal.reason}`.slice(0, 180);
-
-          for (const t of targetTypes) {
-            const found = existingByType.get(t);
-            if (
-              found &&
-              (found.data.attendanceStatus === 'VALID' ||
-                found.data.attendanceStatus === 'LATE')
-            ) {
-              continue;
-            }
-            if (found) {
-              await adminDb
-                .collection('attendance_records')
-                .doc(found.id)
-                .update({
-                  attendanceStatus: 'VALID',
-                  syncStatus: 'SYNCED',
-                  geofenceValid: true,
-                  faceVerified: true,
-                  livenessVerified: true,
-                  livenessDetail: detailText,
-                  reviewedBy: s.username,
-                  reviewNote,
-                  reviewedAtIso: nowIso,
-                  rejectionReason: '',
-                  serverTimestampIso: nowIso,
-                });
-            } else {
-              const txId = `att_${appeal.appealId}_${t === 'CHECK_IN' ? 'IN' : 'OUT'}`;
-              const newRecord: AttendanceRecord = {
-                transactionId: txId,
-                employeeId: appeal.employeeId,
-                employeeName: appeal.employeeName,
-                type: t,
-                workDateWib: appeal.workDateWib,
-                serverTimestampIso: nowIso,
-                deviceTimestampIso: appeal.createdAtIso,
-                gpsTimestampIso: appeal.createdAtIso,
-                latitude: lat,
-                longitude: lng,
-                gpsAccuracyMeters: 0,
-                distanceToOfficeMeters: dist,
-                geofenceValid: true,
-                suspiciousLocationFlags: [],
-                faceMatchScore: 1,
-                faceVerified: true,
-                livenessVerified: true,
-                livenessDetail: detailText,
-                attendanceStatus: 'VALID',
-                syncStatus: 'SYNCED',
-                wasCapturedOffline: false,
-                clockSkewSeconds: 0,
-                rejectionReason: '',
-                reviewedBy: s.username,
-                reviewNote,
-                reviewedAtIso: nowIso,
-                hasEvidence: false,
-              };
-              await adminDb.collection('attendance_records').doc(txId).set(newRecord);
-            }
-          }
-        }
+        await syncAppealToAttendanceRecords(updatedAppeal, settings);
 
         await writeAuditLog({
           actorUsername: s.username,
@@ -1718,7 +2051,7 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // 11. Admin: Dashboard Summary, All Attendance Records, Evidence Inspection, Review & Audit Logs
+  // 11. Admin: Synchronized Dashboard Summary, Daily Attendance Entries & Raw Records
   app.get(
     '/api/admin/attendance',
     requireSession,
@@ -1735,57 +2068,122 @@ export function createApiApp(): express.Express {
           adminDb.collection('attendance_appeals').get(),
         ]);
 
-        const allRecords: AttendanceRecord[] = [];
+        const settings =
+          (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+
+        let allRecords: AttendanceRecord[] = [];
         attSnap.forEach((d) => allRecords.push(d.data() as AttendanceRecord));
+
+        const allAppeals: AttendanceAppeal[] = [];
+        appealSnap.forEach((d) => allAppeals.push(d.data() as AttendanceAppeal));
+
+        const didReconcile = await reconcileUnsyncedAppeals(
+          allAppeals,
+          allRecords,
+          settings
+        );
+        if (didReconcile) {
+          const refreshed = await adminDb.collection('attendance_records').get();
+          allRecords = [];
+          refreshed.forEach((d) => allRecords.push(d.data() as AttendanceRecord));
+        }
+
         allRecords.sort((a, b) =>
           (b.serverTimestampIso || b.deviceTimestampIso).localeCompare(
             a.serverTimestampIso || a.deviceTimestampIso
           )
         );
+        allAppeals.sort((a, b) => b.createdAtIso.localeCompare(a.createdAtIso));
 
-        const activeEmployees = empSnap.docs
-          .map((d) => d.data() as EmployeeProfile)
-          .filter((e) => e.isActive !== false);
+        const allEmployees = empSnap.docs.map((d) => d.data() as EmployeeProfile);
+        const activeEmployees = allEmployees.filter((e) => e.isActive !== false);
 
         const todayWib = getWibParts(new Date()).dateStr;
-        const targetSummaryDate = dateFilter || todayWib;
+        const targetSummaryDate =
+          dateFilter && dateFilter !== 'ALL' ? dateFilter : todayWib;
 
-        const todayCheckIns = allRecords.filter(
-          (r) =>
-            r.workDateWib === targetSummaryDate &&
-            r.type === 'CHECK_IN' &&
-            (r.attendanceStatus === 'VALID' || r.attendanceStatus === 'LATE')
-        );
-        const presentEmpIds = new Set(todayCheckIns.map((r) => r.employeeId));
-        const lateCount = todayCheckIns.filter((r) => r.attendanceStatus === 'LATE').length;
+        // Build daily entries for summary date to compute 100% synced KPI counters
+        const summaryDailyEntries = buildDailyAttendanceEntries({
+          records: allRecords.filter((r) => r.workDateWib === targetSummaryDate),
+          appeals: allAppeals.filter((a) => a.workDateWib === targetSummaryDate),
+          employees: activeEmployees,
+          officeSettings: settings,
+          includeAbsentEmployeesForDate: targetSummaryDate,
+        });
+
+        const presentCount = summaryDailyEntries.filter(
+          (d) =>
+            d.overallStatus === 'HADIR_LENGKAP' ||
+            d.overallStatus === 'SUDAH_MASUK' ||
+            d.overallStatus === 'HADIR_SANGGAH' ||
+            d.overallStatus === 'TERLAMBAT' ||
+            d.overallStatus === 'PULANG_CEPAT'
+        ).length;
+        const lateCount = summaryDailyEntries.filter(
+          (d) => d.overallStatus === 'TERLAMBAT'
+        ).length;
+        const approvedAppealTodayCount = summaryDailyEntries.filter(
+          (d) =>
+            d.overallStatus === 'HADIR_SANGGAH' ||
+            d.linkedAppeal?.status === 'APPROVED'
+        ).length;
+
+        const pendingAppealCount = allAppeals.filter(
+          (a) => a.status === 'PENDING'
+        ).length;
         const pendingReviewCount = allRecords.filter(
-          (r) => r.attendanceStatus === 'NEEDS_REVIEW'
-        ).length;
-        const pendingAppealCount = appealSnap.docs.filter(
-          (d) => d.data()?.status === 'PENDING'
+          (r) => r.attendanceStatus === 'NEEDS_REVIEW' && !r.appealId
         ).length;
 
-        const filtered = allRecords.filter((r) => {
-          const matchDate = !dateFilter || r.workDateWib === dateFilter;
-          const matchSearch =
-            !search ||
+        // Build displayed daily entries & records based on dateFilter
+        const isSingleDate = Boolean(dateFilter && dateFilter !== 'ALL');
+        const recordsForView = isSingleDate
+          ? allRecords.filter((r) => r.workDateWib === dateFilter)
+          : allRecords;
+        const appealsForView = isSingleDate
+          ? allAppeals.filter((a) => a.workDateWib === dateFilter)
+          : allAppeals;
+
+        let dailyEntries = buildDailyAttendanceEntries({
+          records: recordsForView,
+          appeals: appealsForView,
+          employees: activeEmployees,
+          officeSettings: settings,
+          includeAbsentEmployeesForDate: isSingleDate ? dateFilter : undefined,
+        });
+
+        if (search) {
+          dailyEntries = dailyEntries.filter(
+            (d) =>
+              d.employeeName.toLowerCase().includes(search) ||
+              d.employeeId.toLowerCase().includes(search) ||
+              d.notes.toLowerCase().includes(search)
+          );
+        }
+
+        const filteredRecords = recordsForView.filter((r) => {
+          if (!search) return true;
+          return (
             r.employeeName.toLowerCase().includes(search) ||
-            r.employeeId.toLowerCase().includes(search);
-          return matchDate && matchSearch;
+            r.employeeId.toLowerCase().includes(search)
+          );
         });
 
         res.json({
           summary: {
             dateWib: targetSummaryDate,
             totalEmployees: activeEmployees.length,
-            presentCount: presentEmpIds.size,
+            presentCount,
             lateCount,
-            absentCount: Math.max(0, activeEmployees.length - presentEmpIds.size),
+            approvedAppealTodayCount,
+            absentCount: Math.max(0, activeEmployees.length - presentCount),
             pendingReviewCount,
             pendingAppealCount,
           },
-          officeSettings: settingsSnap.data() || DEFAULT_OFFICE_SETTINGS,
-          records: filtered.slice(0, 300),
+          officeSettings: settings,
+          dailyEntries: dailyEntries.slice(0, 300),
+          records: filteredRecords.slice(0, 300),
+          appeals: allAppeals.slice(0, 200),
         });
       } catch (err) {
         console.error('Admin attendance list error:', err);
@@ -1794,7 +2192,108 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // Admin: Inspect specific attendance evidence thumbnail (logged in audit_logs for privacy accountability)
+  // 11b. Admin: Export Synchronized Attendance Recap to Real Excel (.xlsx)
+  app.get(
+    '/api/admin/attendance/export-excel',
+    requireSession,
+    requireAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const s = req.sessionUser!;
+        const dateFilter = String(req.query.date || '').trim();
+        const search = String(req.query.search || '').trim().toLowerCase();
+        const format = String(req.query.format || '').trim().toLowerCase();
+
+        const [attSnap, empSnap, settingsSnap, appealSnap] = await Promise.all([
+          adminDb.collection('attendance_records').get(),
+          adminDb.collection('employees').get(),
+          adminDb.collection('office_settings').doc('main').get(),
+          adminDb.collection('attendance_appeals').get(),
+        ]);
+
+        const settings =
+          (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+        const employees = empSnap.docs
+          .map((d) => d.data() as EmployeeProfile)
+          .filter((e) => e.isActive !== false);
+
+        const allRecords = attSnap.docs.map((d) => d.data() as AttendanceRecord);
+        const allAppeals = appealSnap.docs.map((d) => d.data() as AttendanceAppeal);
+
+        const isSingleDate = Boolean(dateFilter && dateFilter !== 'ALL');
+        const records = isSingleDate
+          ? allRecords.filter((r) => r.workDateWib === dateFilter)
+          : allRecords;
+        const appeals = isSingleDate
+          ? allAppeals.filter((a) => a.workDateWib === dateFilter)
+          : allAppeals;
+
+        let dailyEntries = buildDailyAttendanceEntries({
+          records,
+          appeals,
+          employees,
+          officeSettings: settings,
+          includeAbsentEmployeesForDate: isSingleDate ? dateFilter : undefined,
+        });
+
+        if (search) {
+          dailyEntries = dailyEntries.filter(
+            (d) =>
+              d.employeeName.toLowerCase().includes(search) ||
+              d.employeeId.toLowerCase().includes(search)
+          );
+        }
+
+        const summaryRows = computeSummaryRows(employees, dailyEntries);
+        const periodLabel = isSingleDate ? `Tanggal ${dateFilter}` : 'Semua Riwayat Absensi';
+        const fileName = `Rekap-Absensi-${isSingleDate ? dateFilter : getWibParts().dateStr}.xlsx`;
+
+        const xlsxBuffer = await buildAttendanceExcelBuffer({
+          reportTitle: 'Rekapitulasi Absensi & Sanggah Karyawan',
+          periodLabel,
+          officeSettings: settings,
+          employees,
+          summaryRows,
+          dailyEntries,
+          appeals,
+          records,
+        });
+
+        await writeAuditLog({
+          actorUsername: s.username,
+          actorRole: s.role,
+          action: 'EXPORT_ATTENDANCE_EXCEL',
+          targetId: isSingleDate ? dateFilter : 'ALL',
+          reason: `Unduh rekap absensi format Excel (${fileName})`,
+        });
+
+        if (format === 'json') {
+          res.json({
+            fileName,
+            mimeType:
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            base64: xlsxBuffer.toString('base64'),
+          });
+          return;
+        }
+
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${fileName}"`
+        );
+        res.send(xlsxBuffer);
+      } catch (err) {
+        console.error('Export attendance excel error:', err);
+        res.status(500).json({ error: 'Gagal membuat file Excel rekap absensi.' });
+      }
+    }
+  );
+
+  // Admin: Inspect specific attendance evidence thumbnail
   app.get(
     '/api/admin/attendance/:transactionId/evidence',
     requireSession,
@@ -1823,7 +2322,7 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // Admin: Approve or Reject NEEDS_REVIEW / offline attendance record with mandatory reason & full audit log
+  // Admin: Approve or Reject NEEDS_REVIEW attendance record (Bidirectionally syncs linked Sanggah if present!)
   app.post(
     '/api/admin/attendance/:transactionId/review',
     requireSession,
@@ -1851,6 +2350,38 @@ export function createApiApp(): express.Express {
         }
 
         const prev = txSnap.data() as AttendanceRecord;
+        const nowIso = new Date().toISOString();
+
+        // If this attendance record is linked to an AttendanceAppeal, keep both synchronized!
+        if (prev.appealId) {
+          const aplRef = adminDb.collection('attendance_appeals').doc(prev.appealId);
+          const aplSnap = await aplRef.get();
+          if (aplSnap.exists) {
+            const settingsSnap = await adminDb.collection('office_settings').doc('main').get();
+            const settings =
+              (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+            const apl = aplSnap.data() as AttendanceAppeal;
+            const nextAplStatus: AttendanceAppeal['status'] =
+              decision === 'REJECT' ? 'REJECTED' : 'APPROVED';
+            await aplRef.update({
+              status: nextAplStatus,
+              reviewedBy: s.username,
+              reviewNote: reason,
+              reviewedAtIso: nowIso,
+            });
+            await syncAppealToAttendanceRecords(
+              {
+                ...apl,
+                status: nextAplStatus,
+                reviewedBy: s.username,
+                reviewNote: reason,
+                reviewedAtIso: nowIso,
+              },
+              settings
+            );
+          }
+        }
+
         const nextStatus: AttendanceRecord['attendanceStatus'] =
           decision === 'APPROVE_VALID'
             ? 'VALID'
@@ -1859,15 +2390,16 @@ export function createApiApp(): express.Express {
             : 'REJECTED';
         const nextSyncStatus: AttendanceRecord['syncStatus'] =
           decision === 'REJECT' ? 'REJECTED_SERVER' : 'SYNCED';
-        const nowIso = new Date().toISOString();
 
-        await txRef.update({
-          attendanceStatus: nextStatus,
-          syncStatus: nextSyncStatus,
-          reviewedBy: s.username,
-          reviewNote: reason,
-          reviewedAtIso: nowIso,
-        });
+        if (!prev.appealId) {
+          await txRef.update({
+            attendanceStatus: nextStatus,
+            syncStatus: nextSyncStatus,
+            reviewedBy: s.username,
+            reviewNote: reason,
+            reviewedAtIso: nowIso,
+          });
+        }
 
         await writeAuditLog({
           actorUsername: s.username,
@@ -2028,7 +2560,7 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // Admin: Monthly Recap Report Data + Mark Monthly Email Sent via Gmail API
+  // Admin: Monthly Recap Report Data (Synchronized Attendance + Sanggah)
   app.get(
     '/api/admin/monthly-report',
     requireSession,
@@ -2042,50 +2574,44 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        const [empSnap, attSnap, settingsSnap] = await Promise.all([
+        const [empSnap, attSnap, appealSnap, settingsSnap] = await Promise.all([
           adminDb.collection('employees').get(),
           adminDb.collection('attendance_records').get(),
+          adminDb.collection('attendance_appeals').get(),
           adminDb.collection('office_settings').doc('main').get(),
         ]);
 
         const settings = (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
         const employees = empSnap.docs.map((d) => d.data() as EmployeeProfile);
-        const monthRecords = attSnap.docs
+
+        let monthRecords = attSnap.docs
           .map((d) => d.data() as AttendanceRecord)
           .filter((r) => r.workDateWib.startsWith(period));
+        const monthAppeals = appealSnap.docs
+          .map((d) => d.data() as AttendanceAppeal)
+          .filter((a) => a.workDateWib.startsWith(period));
 
-        const rows = employees.map((emp) => {
-          const empRecs = monthRecords.filter((r) => r.employeeId === emp.employeeId);
-          const checkInsValid = empRecs.filter(
-            (r) => r.type === 'CHECK_IN' && r.attendanceStatus === 'VALID'
-          ).length;
-          const checkInsLate = empRecs.filter(
-            (r) => r.type === 'CHECK_IN' && r.attendanceStatus === 'LATE'
-          ).length;
-          const checkOuts = empRecs.filter(
-            (r) => r.type === 'CHECK_OUT' && r.attendanceStatus === 'VALID'
-          ).length;
-          const pendingReviews = empRecs.filter(
-            (r) => r.attendanceStatus === 'NEEDS_REVIEW'
-          ).length;
-          const rejected = empRecs.filter(
-            (r) => r.attendanceStatus === 'REJECTED'
-          ).length;
+        const didReconcile = await reconcileUnsyncedAppeals(
+          monthAppeals,
+          monthRecords,
+          settings
+        );
+        if (didReconcile) {
+          const refreshed = await adminDb.collection('attendance_records').get();
+          monthRecords = refreshed.docs
+            .map((d) => d.data() as AttendanceRecord)
+            .filter((r) => r.workDateWib.startsWith(period));
+        }
 
-          return {
-            employeeId: emp.employeeId,
-            fullName: emp.fullName,
-            position: emp.position,
-            totalPresentDays: checkInsValid + checkInsLate,
-            onTimeDays: checkInsValid,
-            lateDays: checkInsLate,
-            completedCheckOuts: checkOuts,
-            pendingReviews,
-            rejectedAttempts: rejected,
-          };
+        const dailyEntries = buildDailyAttendanceEntries({
+          records: monthRecords,
+          appeals: monthAppeals,
+          employees,
+          officeSettings: settings,
         });
 
-        // Determine if today is end-of-month (last 3 days of month) or previous month not yet sent
+        const rows = computeSummaryRows(employees, dailyEntries);
+
         const [yr, mo] = period.split('-').map(Number);
         const lastDayOfMonth = new Date(yr, mo, 0).getDate();
         const isEndOfMonthWindow =
@@ -2101,7 +2627,9 @@ export function createApiApp(): express.Express {
           isEndOfMonthWindow,
           lastDayOfMonth,
           rows,
+          dailyEntries,
           totalRecordsInMonth: monthRecords.length,
+          totalAppealsInMonth: monthAppeals.length,
         });
       } catch (err) {
         console.error('Monthly report error:', err);
@@ -2110,7 +2638,94 @@ export function createApiApp(): express.Express {
     }
   );
 
-  // Admin: Send Monthly Recap Email via Client-Provided Gmail OAuth Bearer Token
+  // Admin: Download Monthly Recap as Real Excel (.xlsx)
+  app.get(
+    '/api/admin/monthly-report/export-excel',
+    requireSession,
+    requireAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        const s = req.sessionUser!;
+        const wibNow = getWibParts(new Date());
+        const period = String(req.query.period || wibNow.monthPeriod);
+        const format = String(req.query.format || '').trim().toLowerCase();
+
+        if (!/^\d{4}-\d{2}$/.test(period)) {
+          res.status(400).json({ error: 'Format periode bulan harus YYYY-MM.' });
+          return;
+        }
+
+        const [empSnap, attSnap, appealSnap, settingsSnap] = await Promise.all([
+          adminDb.collection('employees').get(),
+          adminDb.collection('attendance_records').get(),
+          adminDb.collection('attendance_appeals').get(),
+          adminDb.collection('office_settings').doc('main').get(),
+        ]);
+
+        const settings = (settingsSnap.data() as OfficeSettings) || DEFAULT_OFFICE_SETTINGS;
+        const employees = empSnap.docs.map((d) => d.data() as EmployeeProfile);
+        const monthRecords = attSnap.docs
+          .map((d) => d.data() as AttendanceRecord)
+          .filter((r) => r.workDateWib.startsWith(period));
+        const monthAppeals = appealSnap.docs
+          .map((d) => d.data() as AttendanceAppeal)
+          .filter((a) => a.workDateWib.startsWith(period));
+
+        const dailyEntries = buildDailyAttendanceEntries({
+          records: monthRecords,
+          appeals: monthAppeals,
+          employees,
+          officeSettings: settings,
+        });
+        const summaryRows = computeSummaryRows(employees, dailyEntries);
+        const fileName = `Rekap-Absensi-Bulanan-${period}.xlsx`;
+
+        const xlsxBuffer = await buildAttendanceExcelBuffer({
+          reportTitle: `Rekapitulasi Absensi Bulanan (${period})`,
+          periodLabel: `Bulan ${period}`,
+          officeSettings: settings,
+          employees,
+          summaryRows,
+          dailyEntries,
+          appeals: monthAppeals,
+          records: monthRecords,
+        });
+
+        await writeAuditLog({
+          actorUsername: s.username,
+          actorRole: s.role,
+          action: 'EXPORT_MONTHLY_EXCEL',
+          targetId: period,
+          reason: `Unduh rekap bulanan Excel (${fileName})`,
+        });
+
+        if (format === 'json') {
+          res.json({
+            fileName,
+            mimeType:
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            base64: xlsxBuffer.toString('base64'),
+          });
+          return;
+        }
+
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${fileName}"`
+        );
+        res.send(xlsxBuffer);
+      } catch (err) {
+        console.error('Monthly excel export error:', err);
+        res.status(500).json({ error: 'Gagal mengunduh file Excel bulanan.' });
+      }
+    }
+  );
+
+  // Admin: Send Monthly Recap Email with Excel (.xlsx) Attachment via Gmail API
   app.post(
     '/api/admin/monthly-report/send-email',
     requireSession,
@@ -2121,7 +2736,7 @@ export function createApiApp(): express.Express {
         const gmailAccessToken = String(req.body?.gmailAccessToken || '').trim();
         const period = String(req.body?.period || '').trim();
         const recipientEmail = String(req.body?.recipientEmail || '').trim();
-        const triggerMode = String(req.body?.triggerMode || 'MANUAL'); // 'AUTO_EOM' | 'MANUAL'
+        const triggerMode = String(req.body?.triggerMode || 'MANUAL');
 
         if (!gmailAccessToken) {
           res.status(400).json({
@@ -2134,9 +2749,10 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        const [empSnap, attSnap, settingsSnap] = await Promise.all([
+        const [empSnap, attSnap, appealSnap, settingsSnap] = await Promise.all([
           adminDb.collection('employees').get(),
           adminDb.collection('attendance_records').get(),
+          adminDb.collection('attendance_appeals').get(),
           adminDb.collection('office_settings').doc('main').get(),
         ]);
 
@@ -2145,76 +2761,75 @@ export function createApiApp(): express.Express {
         const monthRecords = attSnap.docs
           .map((d) => d.data() as AttendanceRecord)
           .filter((r) => r.workDateWib.startsWith(period));
+        const monthAppeals = appealSnap.docs
+          .map((d) => d.data() as AttendanceAppeal)
+          .filter((a) => a.workDateWib.startsWith(period));
 
-        const csvLines = [
-          'ID Karyawan,Nama Lengkap,Jabatan,Total Hadir,Tepat Waktu,Terlambat,Absen Pulang Valid,Menunggu Review,Ditolak',
-        ];
+        const dailyEntries = buildDailyAttendanceEntries({
+          records: monthRecords,
+          appeals: monthAppeals,
+          employees,
+          officeSettings: settings,
+        });
+        const summaryRows = computeSummaryRows(employees, dailyEntries);
 
-        const htmlRows: string[] = [];
-        for (const emp of employees) {
-          const empRecs = monthRecords.filter((r) => r.employeeId === emp.employeeId);
-          const onTime = empRecs.filter(
-            (r) => r.type === 'CHECK_IN' && r.attendanceStatus === 'VALID'
-          ).length;
-          const late = empRecs.filter(
-            (r) => r.type === 'CHECK_IN' && r.attendanceStatus === 'LATE'
-          ).length;
-          const totalPresent = onTime + late;
-          const checkOut = empRecs.filter(
-            (r) => r.type === 'CHECK_OUT' && r.attendanceStatus === 'VALID'
-          ).length;
-          const pending = empRecs.filter(
-            (r) => r.attendanceStatus === 'NEEDS_REVIEW'
-          ).length;
-          const rejected = empRecs.filter(
-            (r) => r.attendanceStatus === 'REJECTED'
-          ).length;
+        const xlsxBuffer = await buildAttendanceExcelBuffer({
+          reportTitle: `Rekapitulasi Absensi Bulanan (${period})`,
+          periodLabel: `Bulan ${period}`,
+          officeSettings: settings,
+          employees,
+          summaryRows,
+          dailyEntries,
+          appeals: monthAppeals,
+          records: monthRecords,
+        });
 
-          csvLines.push(
-            `"${emp.employeeId}","${emp.fullName}","${emp.position}",${totalPresent},${onTime},${late},${checkOut},${pending},${rejected}`
-          );
-          htmlRows.push(`
+        const fileName = `Rekap-Absensi-${period}.xlsx`;
+        const rawBase64 = xlsxBuffer.toString('base64');
+        const wrappedXlsxBase64 = rawBase64.match(/.{1,76}/g)?.join('\r\n') || rawBase64;
+
+        const htmlRows = summaryRows.map(
+          (row) => `
             <tr>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;">${emp.employeeId}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:600;">${emp.fullName}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${totalPresent}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#15803d;">${onTime}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#b45309;">${late}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${checkOut}</td>
-              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${pending}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;">${row.employeeId}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:600;">${row.fullName}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:700;">${row.totalPresentDays}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#15803d;">${row.onTimeDays}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#b45309;">${row.lateDays}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;color:#0369a1;">${row.approvedAppealDays}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:right;">${row.completedCheckOuts}</td>
             </tr>
-          `);
-        }
+          `
+        );
 
-        const subject = `[ABSENSI WAJAH & GPS] Laporan Rekapitulasi Bulanan ${period} — ${settings.officeName}`;
+        const subject = `[ABSENSI WAJAH & GPS] Rekap Excel Absensi Bulanan ${period} — ${settings.officeName}`;
         const boundary = `absensi_boundary_${Date.now()}`;
-        const csvAttachmentB64 = Buffer.from(csvLines.join('\n'), 'utf-8').toString('base64');
 
         const htmlBody = `
-          <div style="font-family:Arial,sans-serif;color:#0f172a;max-width:720px;margin:0 auto;">
+          <div style="font-family:Arial,sans-serif;color:#0f172a;max-width:740px;margin:0 auto;">
             <div style="background:#0F2942;color:#ffffff;padding:20px 24px;border-radius:8px 8px 0 0;">
               <h2 style="margin:0;font-size:18px;">Laporan Rekapitulasi Absensi Bulanan (${period})</h2>
-              <p style="margin:6px 0 0;font-size:13px;color:#bae6fd;">${settings.officeName} · Waktu Cetak: ${formatWibDateTime(new Date())}</p>
+              <p style="margin:6px 0 0;font-size:13px;color:#bae6fd;">${settings.officeName} · Dicetak: ${formatWibDateTime(new Date())}</p>
             </div>
             <div style="border:1px solid #cbd5e1;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px;">
-              <p style="font-size:14px;line-height:1.5;">Berikut adalah ringkasan kehadiran karyawan periode <strong>${period}</strong> beserta lampiran CSV lengkap:</p>
+              <p style="font-size:14px;line-height:1.5;">Berikut ringkasan kehadiran karyawan periode <strong>${period}</strong> beserta lampiran <strong>Excel (${fileName})</strong> yang sudah sinkron dengan data Sanggah Absen:</p>
               <table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px;">
                 <thead>
                   <tr style="background:#f1f5f9;text-align:left;">
                     <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;">ID</th>
                     <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;">Nama</th>
-                    <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Hadir</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Total Hadir</th>
                     <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Tepat</th>
                     <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Telat</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Sanggah</th>
                     <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Pulang</th>
-                    <th style="padding:8px 12px;border-bottom:2px solid #cbd5e1;text-align:right;">Pending</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${htmlRows.join('') || '<tr><td colspan="7" style="padding:12px;">Belum ada data karyawan.</td></tr>'}
                 </tbody>
               </table>
-              <p style="margin-top:18px;font-size:12px;color:#64748b;">Dikirim melalui sistem rekapitulasi ABSENSI WAJAH &amp; GPS (${triggerMode === 'AUTO_EOM' ? 'Jadwal Otomatis Akhir Bulan' : 'Pengiriman Terkonfirmasi Admin'}).</p>
+              <p style="margin-top:18px;font-size:12px;color:#64748b;">Lampiran Excel (.xlsx) mencakup 4 lembar: Rekap Harian Absensi, Ringkasan Karyawan, Data Sanggah Absen, dan Log Transaksi Detail.</p>
             </div>
           </div>
         `;
@@ -2231,11 +2846,11 @@ export function createApiApp(): express.Express {
           htmlBody,
           '',
           `--${boundary}`,
-          `Content-Type: text/csv; name="Rekap-Absensi-${period}.csv"`,
+          `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; name="${fileName}"`,
           'Content-Transfer-Encoding: base64',
-          `Content-Disposition: attachment; filename="Rekap-Absensi-${period}.csv"`,
+          `Content-Disposition: attachment; filename="${fileName}"`,
           '',
-          csvAttachmentB64,
+          wrappedXlsxBase64,
           `--${boundary}--`,
         ].join('\r\n');
 
@@ -2267,24 +2882,21 @@ export function createApiApp(): express.Express {
           return;
         }
 
-        await adminDb.collection('office_settings').doc('main').set(
-          {
-            lastMonthlyReportPeriod: period,
-            updatedAtIso: new Date().toISOString(),
-          },
-          { merge: true }
-        );
+        await adminDb.collection('office_settings').doc('main').update({
+          lastMonthlyReportPeriod: period,
+          updatedAtIso: new Date().toISOString(),
+        });
 
         await writeAuditLog({
           actorUsername: s.username,
           actorRole: s.role,
           action: 'SEND_MONTHLY_REPORT_EMAIL',
           targetId: period,
-          newValueSummary: `Terkirim ke ${recipientEmail} (Message ID: ${gmailData.id})`,
+          newValueSummary: `Excel ${fileName} terkirim ke ${recipientEmail} (Message ID: ${gmailData.id})`,
           reason:
             triggerMode === 'AUTO_EOM'
-              ? `Pengiriman otomatis rekapitulasi akhir bulan ${period}`
-              : `Pengiriman laporan rekapitulasi bulanan ${period} oleh Admin`,
+              ? `Pengiriman otomatis rekapitulasi Excel akhir bulan ${period}`
+              : `Pengiriman laporan rekapitulasi Excel bulanan ${period} oleh Admin`,
         });
 
         res.json({

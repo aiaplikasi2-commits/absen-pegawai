@@ -49,6 +49,7 @@ export type AttendanceType = 'CHECK_IN' | 'CHECK_OUT';
 export type AttendanceStatus =
   | 'VALID'
   | 'LATE'
+  | 'EARLY_LEAVE'
   | 'REJECTED'
   | 'NEEDS_REVIEW'
   | 'PENDING_OFFLINE';
@@ -88,6 +89,9 @@ export interface AttendanceRecord {
   reviewNote?: string;
   reviewedAtIso?: string;
   hasEvidence?: boolean;
+  appealId?: string;
+  appealStatus?: AppealStatus;
+  appealCategory?: string;
 }
 
 export type AppealScope = 'FULL_DAY' | 'CHECK_IN' | 'CHECK_OUT';
@@ -108,6 +112,38 @@ export interface AttendanceAppeal {
   reviewedBy?: string;
   reviewNote?: string;
   reviewedAtIso?: string;
+}
+
+export type DailyOverallStatus =
+  | 'HADIR_LENGKAP'
+  | 'SUDAH_MASUK'
+  | 'HADIR_SANGGAH'
+  | 'TERLAMBAT'
+  | 'PULANG_CEPAT'
+  | 'MENUNGGU_SANGGAH'
+  | 'MENUNGGU_REVIEW'
+  | 'DITOLAK'
+  | 'BELUM_HADIR';
+
+export interface DailyAttendanceEntry {
+  key: string;
+  workDateWib: string;
+  employeeId: string;
+  employeeName: string;
+  position: string;
+  overallStatus: DailyOverallStatus;
+  overallLabel: string;
+  sourceLabel: 'Kamera & GPS' | 'Sanggah Absen' | 'Kamera & Sanggah' | '-';
+  checkInTimeWib: string;
+  checkInStatusLabel: string;
+  checkInRecord?: AttendanceRecord;
+  checkOutTimeWib: string;
+  checkOutStatusLabel: string;
+  checkOutRecord?: AttendanceRecord;
+  durationLabel: string;
+  locationOrFaceSummary: string;
+  notes: string;
+  linkedAppeal?: AttendanceAppeal;
 }
 
 export interface LocalPendingRecord extends AttendanceRecord {

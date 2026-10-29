@@ -305,7 +305,7 @@
         },
         "attendanceStatus": {
           "type": "string",
-          "enum": ["VALID", "LATE", "REJECTED", "NEEDS_REVIEW", "PENDING_OFFLINE"]
+          "enum": ["VALID", "LATE", "EARLY_LEAVE", "REJECTED", "NEEDS_REVIEW", "PENDING_OFFLINE"]
         },
         "syncStatus": {
           "type": "string",
@@ -332,6 +332,21 @@
         "reviewedAtIso": {
           "type": "string",
           "maxLength": 40
+        },
+        "hasEvidence": {
+          "type": "boolean"
+        },
+        "appealId": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "appealStatus": {
+          "type": "string",
+          "enum": ["PENDING", "APPROVED", "REJECTED"]
+        },
+        "appealCategory": {
+          "type": "string",
+          "maxLength": 80
         }
       },
       "required": [

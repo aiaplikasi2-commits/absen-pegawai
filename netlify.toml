@@ -5,7 +5,7 @@
 
 [functions]
   node_bundler = "esbuild"
-  external_node_modules = ["firebase-admin", "firebase", "express", "bcryptjs", "jsonwebtoken", "serverless-http"]
+  external_node_modules = ["firebase-admin", "firebase", "express", "bcryptjs", "jsonwebtoken", "serverless-http", "exceljs"]
 
 [[redirects]]
   from = "/api/*"

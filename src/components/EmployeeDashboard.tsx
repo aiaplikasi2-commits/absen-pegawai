@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   MapPin,
   Wifi,
@@ -15,6 +15,7 @@ import {
   ShieldCheck,
   FileText,
   Send,
+  Camera,
 } from 'lucide-react';
 import type {
   AppealScope,
@@ -22,6 +23,7 @@ import type {
   AttendanceRecord,
   AttendanceType,
   AuthSessionUser,
+  DailyAttendanceEntry,
   GpsReading,
   LocalPendingRecord,
   OfficeSettings,
@@ -29,13 +31,15 @@ import type {
 import { acquireFreshGpsLocation } from '../services/gpsValidator';
 import {
   calculateGeodesicDistanceMeters,
+  formatWibDateLong,
   formatWibDateTime,
-  formatWibTimeOnly,
   getWibParts,
 } from '../utils/geoAndTime';
+import { buildDailyAttendanceEntries } from '../utils/attendanceSyncView';
 import {
   appendLocalSyncEvent,
   cacheAttendanceHistoryLocally,
+  cacheFaceProfileLocally,
   exportPendingRecordsJson,
   getAllLocalPendingAttendance,
   getCachedAttendanceHistory,
@@ -54,16 +58,37 @@ interface EmployeeDashboardProps {
   officeSettings: OfficeSettings | null;
   isOnline: boolean;
   onConsentAccepted: () => void;
+  onFaceRegistered: () => void;
 }
 
 type EmployeeTab = 'ABSEN' | 'SANGGAH' | 'RIWAYAT';
 
 const APPEAL_CATEGORIES = [
+  'Kegiatan di Luar Kantor',
   'Tugas Lapangan',
   'Dinas Luar',
   'Kunjungan Klien',
-  'Kendala Teknis',
+  'Kendala Teknis / Darurat',
 ];
+
+function getDailyBadgeClasses(status: DailyAttendanceEntry['overallStatus']): string {
+  switch (status) {
+    case 'HADIR_LENGKAP':
+    case 'SUDAH_MASUK':
+      return 'border-emerald-200 bg-emerald-50 text-emerald-800';
+    case 'HADIR_SANGGAH':
+      return 'border-sky-200 bg-sky-50 text-sky-900';
+    case 'TERLAMBAT':
+    case 'PULANG_CEPAT':
+    case 'MENUNGGU_SANGGAH':
+    case 'MENUNGGU_REVIEW':
+      return 'border-amber-200 bg-amber-50 text-amber-900';
+    case 'DITOLAK':
+      return 'border-red-200 bg-red-50 text-red-800';
+    default:
+      return 'border-slate-200 bg-slate-100 text-slate-700';
+  }
+}
 
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   user,
@@ -71,6 +96,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   officeSettings: propSettings,
   isOnline,
   onConsentAccepted,
+  onFaceRegistered,
 }) => {
   const [activeTab, setActiveTab] = useState<EmployeeTab>('ABSEN');
   const [wibClock, setWibClock] = useState<string>(() =>
@@ -88,11 +114,22 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
   const [activeAttendanceType, setActiveAttendanceType] =
     useState<AttendanceType | null>(null);
+  const [selfEnrollingFace, setSelfEnrollingFace] = useState<boolean>(false);
+  const [savingFace, setSavingFace] = useState<boolean>(false);
   const [submitting, setSubmitting] = useState<boolean>(false);
+
   const [feedbackBanner, setFeedbackBanner] = useState<{
     kind: 'success' | 'warning' | 'error';
     title: string;
     detail: string;
+    appealAction?: {
+      label: string;
+      workDateWib: string;
+      scope: AppealScope;
+      category: string;
+      contextHint: string;
+    };
+    enrollFaceAction?: boolean;
   } | null>(null);
 
   // Sanggah Absen form state
@@ -100,15 +137,18 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     () => getWibParts(new Date()).dateStr
   );
   const [appealScope, setAppealScope] = useState<AppealScope>('FULL_DAY');
-  const [appealCategory, setAppealCategory] =
-    useState<string>('Tugas Lapangan');
+  const [appealCategory, setAppealCategory] = useState<string>(
+    'Kegiatan di Luar Kantor'
+  );
   const [appealReason, setAppealReason] = useState<string>('');
+  const [appealContextHint, setAppealContextHint] = useState<string | null>(null);
   const [submittingAppeal, setSubmittingAppeal] = useState<boolean>(false);
 
   const [syncingNow, setSyncingNow] = useState<boolean>(false);
   const [consentSubmitting, setConsentSubmitting] = useState<boolean>(false);
   const syncLockRef = useRef<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const reasonTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -156,6 +196,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           const data = await histResp.json();
           const recs: AttendanceRecord[] = data.records || [];
           setHistory(recs);
+          if (Array.isArray(data.appeals)) {
+            setAppeals(data.appeals);
+          }
           await cacheAttendanceHistoryLocally(recs);
           return;
         }
@@ -187,6 +230,82 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   useEffect(() => {
     refreshGps();
   }, [refreshGps]);
+
+  const openContextualAppeal = useCallback(
+    (
+      workDateWib: string,
+      scope: AppealScope,
+      category: string = 'Kegiatan di Luar Kantor',
+      hintText?: string
+    ) => {
+      setAppealDate(workDateWib);
+      setAppealScope(scope);
+      setAppealCategory(category);
+      setAppealContextHint(hintText || null);
+      setActiveTab('SANGGAH');
+      setTimeout(() => {
+        reasonTextareaRef.current?.focus();
+      }, 80);
+    },
+    []
+  );
+
+  const handleSelfFaceEnrollSuccess = async (bio: BiometricCaptureResult) => {
+    setSelfEnrollingFace(false);
+    if (!isOnline) {
+      setFeedbackBanner({
+        kind: 'error',
+        title: 'Perlu Koneksi Internet',
+        detail: 'Perekaman referensi wajah harus dilakukan saat perangkat terhubung ke internet.',
+      });
+      return;
+    }
+
+    setSavingFace(true);
+    setFeedbackBanner(null);
+    try {
+      const resp = await apiFetch('/api/employee/face-profile', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          descriptorVector: bio.descriptorVector,
+          sampleCount: bio.sampleCount,
+          qualityScore: bio.qualityScore,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setFeedbackBanner({
+          kind: 'error',
+          title: 'Gagal Menyimpan Wajah',
+          detail: data.error || 'Silakan ulangi perekaman wajah di tempat terang.',
+        });
+        return;
+      }
+
+      const threshold = data.threshold || settings?.faceMatchThreshold || 0.84;
+      await cacheFaceProfileLocally(user.employeeId, bio.descriptorVector, threshold);
+      setLocalFaceVector(bio.descriptorVector);
+      onFaceRegistered();
+
+      setFeedbackBanner({
+        kind: 'success',
+        title: 'Wajah Berhasil Direkam',
+        detail: `Referensi wajah akun ${user.fullName} sudah aktif dan siap digunakan untuk Absen Masuk & Pulang.`,
+      });
+    } catch {
+      setFeedbackBanner({
+        kind: 'error',
+        title: 'Gagal Menyimpan Wajah',
+        detail: 'Periksa koneksi internet Anda lalu coba kembali.',
+      });
+    } finally {
+      setSavingFace(false);
+    }
+  };
 
   const syncPendingRecords = useCallback(async () => {
     if (!isOnline || syncLockRef.current) return;
@@ -312,9 +431,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
     if (!user.hasFaceProfile && !localFaceVector) {
       setFeedbackBanner({
-        kind: 'error',
-        title: 'Wajah Belum Terdaftar',
-        detail: 'Hubungi Admin untuk pendaftaran wajah.',
+        kind: 'warning',
+        title: 'Wajah Belum Direkam',
+        detail: 'Silakan rekam wajah Anda terlebih dahulu langsung dari akun ini sebelum melakukan absensi.',
+        enrollFaceAction: true,
       });
       return;
     }
@@ -323,12 +443,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       setFeedbackBanner({
         kind: 'error',
         title: 'Perlu Koneksi Internet',
-        detail: 'Sambungkan internet satu kali untuk memuat data wajah.',
+        detail: 'Sambungkan internet satu kali untuk memuat data wajah Anda.',
       });
       return;
     }
 
     setGpsLoading(true);
+    const todayDate = getWibParts(new Date()).dateStr;
     try {
       const freshGps = await acquireFreshGpsLocation(14000);
       setGpsReading(freshGps);
@@ -339,7 +460,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           setFeedbackBanner({
             kind: 'warning',
             title: 'Akurasi GPS Rendah',
-            detail: `±${freshGps.accuracyMeters}m (maks ±${settings.maxGpsAccuracyMeters}m). Coba di area terbuka.`,
+            detail: `Akurasi ±${freshGps.accuracyMeters}m (maksimal ±${settings.maxGpsAccuracyMeters}m). Pindah ke area terbuka lalu coba lagi.`,
           });
           return;
         }
@@ -350,10 +471,23 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           settings.longitude
         );
         if (dist > settings.radiusMeters) {
+          const targetScope: AppealScope = type === 'CHECK_IN' ? 'CHECK_IN' : 'CHECK_OUT';
           setFeedbackBanner({
             kind: 'error',
             title: 'Di Luar Radius Kantor',
-            detail: `Jarak ${dist}m (batas ${settings.radiusMeters}m). Gunakan menu Sanggah jika tugas luar.`,
+            detail: `Jarak Anda ${dist}m dari kantor (batas ${settings.radiusMeters}m). Bila sedang ada kegiatan di luar kantor, silakan klik Sanggah.`,
+            appealAction: {
+              label:
+                type === 'CHECK_IN'
+                  ? 'Klik Sanggah Absen Masuk'
+                  : 'Klik Sanggah Absen Pulang',
+              workDateWib: todayDate,
+              scope: targetScope,
+              category: 'Kegiatan di Luar Kantor',
+              contextHint: `Sanggah ${
+                type === 'CHECK_IN' ? 'Absen Masuk' : 'Absen Pulang'
+              } karena sedang bertugas di luar radius kantor (${formatWibDateLong(todayDate)})`,
+            },
           });
           return;
         }
@@ -365,7 +499,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       setFeedbackBanner({
         kind: 'error',
         title: 'GPS Tidak Tersedia',
-        detail: err?.message || 'Aktifkan GPS dan izin lokasi.',
+        detail: err?.message || 'Aktifkan GPS dan izin lokasi pada browser Android.',
       });
     } finally {
       setGpsLoading(false);
@@ -398,9 +532,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       setFeedbackBanner({
         kind: 'error',
         title: 'Wajah Tidak Cocok',
-        detail: `Skor ${(localScore * 100).toFixed(1)}% (minimal ${(
+        detail: `Skor kecocokan ${(localScore * 100).toFixed(1)}% (minimal ${(
           settings.faceMatchThreshold * 100
-        ).toFixed(0)}%).`,
+        ).toFixed(0)}%). Pastikan pencahayaan terang atau rekam ulang wajah.`,
       });
       return;
     }
@@ -450,7 +584,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         title: 'Disimpan Offline',
         detail: `${
           type === 'CHECK_IN' ? 'Absen Masuk' : 'Absen Pulang'
-        } akan dikirim saat online.`,
+        } akan disinkronkan otomatis saat internet aktif.`,
       });
     };
 
@@ -496,8 +630,42 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         if (rec.attendanceStatus === 'NEEDS_REVIEW') {
           setFeedbackBanner({
             kind: 'warning',
-            title: 'Menunggu Persetujuan Admin',
+            title: 'Menunggu Pemeriksaan Admin',
             detail: rec.rejectionReason || 'Sedang diperiksa Admin.',
+          });
+        } else if (rec.attendanceStatus === 'LATE') {
+          setFeedbackBanner({
+            kind: 'warning',
+            title: 'Absen Masuk Tercatat (Terlambat)',
+            detail: `${formatWibDateTime(
+              rec.serverTimestampIso || deviceTimestampIso
+            )} — Apabila keterlambatan karena kegiatan di luar kantor, langsung klik Sanggah di bawah ini.`,
+            appealAction: {
+              label: 'Ada Kegiatan di Luar? Klik Sanggah Masuk',
+              workDateWib: rec.workDateWib,
+              scope: 'CHECK_IN',
+              category: 'Kegiatan di Luar Kantor',
+              contextHint: `Sanggah keterlambatan Absen Masuk pada ${formatWibDateLong(
+                rec.workDateWib
+              )} karena kegiatan di luar kantor`,
+            },
+          });
+        } else if (rec.attendanceStatus === 'EARLY_LEAVE') {
+          setFeedbackBanner({
+            kind: 'warning',
+            title: 'Absen Pulang Cepat Tercatat',
+            detail: `${formatWibDateTime(
+              rec.serverTimestampIso || deviceTimestampIso
+            )} — Sebelum jam pulang (${settings.workEndTime} WIB). Bila lanjut tugas di luar kantor, silakan klik Sanggah Pulang.`,
+            appealAction: {
+              label: 'Ada Kegiatan di Luar? Klik Sanggah Pulang',
+              workDateWib: rec.workDateWib,
+              scope: 'CHECK_OUT',
+              category: 'Kegiatan di Luar Kantor',
+              contextHint: `Sanggah Absen Pulang Cepat pada ${formatWibDateLong(
+                rec.workDateWib
+              )} karena lanjutan tugas/kegiatan di luar kantor`,
+            },
           });
         } else {
           setFeedbackBanner({
@@ -505,9 +673,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
             title: `Absen ${type === 'CHECK_IN' ? 'Masuk' : 'Pulang'} Berhasil`,
             detail: `${formatWibDateTime(
               rec.serverTimestampIso || deviceTimestampIso
-            )} · ${
-              rec.attendanceStatus === 'LATE' ? 'Terlambat' : 'Tepat Waktu'
-            }`,
+            )} · Tepat Waktu`,
           });
         }
         await loadAttendanceData();
@@ -560,11 +726,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         });
       } else {
         setAppealReason('');
+        setAppealContextHint(null);
         await loadAttendanceData();
         setFeedbackBanner({
           kind: 'success',
-          title: 'Sanggah Terkirim',
-          detail: 'Menunggu persetujuan Admin.',
+          title: 'Sanggah Tersinkron ke Absensi',
+          detail:
+            'Pengajuan sanggah berhasil dikirim dan otomatis tercatat pada Riwayat Absensi sambil menunggu persetujuan Admin.',
         });
       }
     } catch {
@@ -620,18 +788,96 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   };
 
   const todayWib = getWibParts(new Date()).dateStr;
-  const todayCheckIn = history.find(
+  const hasFaceReady = Boolean(user.hasFaceProfile || localFaceVector);
+
+  // Build synchronized daily entries combining history + pendingLocal + appeals
+  const dailyEntries = useMemo(() => {
+    const combinedRecords: AttendanceRecord[] = [
+      ...pendingLocal.filter((p) => p.syncStatus === 'WAITING_SYNC'),
+      ...history,
+    ];
+    return buildDailyAttendanceEntries({
+      records: combinedRecords,
+      appeals,
+      employees: [
+        {
+          employeeId: user.employeeId,
+          fullName: user.fullName,
+          username: user.username,
+          position: user.position,
+          hasFaceProfile: hasFaceReady,
+          consentAccepted: user.consentAccepted,
+          isActive: true,
+          createdAtIso: '',
+        },
+      ],
+      officeSettings: settings,
+      includeAbsentEmployeesForDate: todayWib,
+    });
+  }, [appeals, hasFaceReady, history, pendingLocal, settings, todayWib, user]);
+
+  const todayEntry = useMemo(
+    () => dailyEntries.find((d) => d.workDateWib === todayWib),
+    [dailyEntries, todayWib]
+  );
+
+  // Real camera scan checks for disabling scan buttons
+  const todayCameraCheckIn = history.find(
     (r) =>
       r.workDateWib === todayWib &&
       r.type === 'CHECK_IN' &&
+      !r.appealId &&
       r.attendanceStatus !== 'REJECTED'
   );
-  const todayCheckOut = history.find(
+  const todayCameraCheckOut = history.find(
     (r) =>
       r.workDateWib === todayWib &&
       r.type === 'CHECK_OUT' &&
+      !r.appealId &&
       r.attendanceStatus !== 'REJECTED'
   );
+
+  const hasApprovedCheckInToday =
+    Boolean(todayCameraCheckIn) ||
+    appeals.some(
+      (a) =>
+        a.workDateWib === todayWib &&
+        (a.scope === 'CHECK_IN' || a.scope === 'FULL_DAY') &&
+        a.status === 'APPROVED'
+    );
+
+  const hasApprovedCheckOutToday =
+    Boolean(todayCameraCheckOut) ||
+    appeals.some(
+      (a) =>
+        a.workDateWib === todayWib &&
+        (a.scope === 'CHECK_OUT' || a.scope === 'FULL_DAY') &&
+        a.status === 'APPROVED'
+    );
+
+  const hasActiveInAppealToday = appeals.some(
+    (a) =>
+      a.workDateWib === todayWib &&
+      (a.scope === 'CHECK_IN' || a.scope === 'FULL_DAY') &&
+      (a.status === 'PENDING' || a.status === 'APPROVED')
+  );
+
+  const hasActiveOutAppealToday = appeals.some(
+    (a) =>
+      a.workDateWib === todayWib &&
+      (a.scope === 'CHECK_OUT' || a.scope === 'FULL_DAY') &&
+      (a.status === 'PENDING' || a.status === 'APPROVED')
+  );
+
+  const isTodayCheckInLate =
+    todayCameraCheckIn?.attendanceStatus === 'LATE' && !hasActiveInAppealToday;
+  const isTodayCheckOutEarly =
+    todayCameraCheckOut?.attendanceStatus === 'EARLY_LEAVE' &&
+    !hasActiveOutAppealToday;
+  const canAppealMissingCheckOutToday =
+    hasApprovedCheckInToday &&
+    !todayCameraCheckOut &&
+    !hasActiveOutAppealToday;
 
   const currentDistance =
     gpsReading && settings
@@ -669,7 +915,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
             <h2 className="text-base font-bold">Izin Kamera &amp; Lokasi</h2>
           </div>
           <p className="text-sm text-slate-600">
-            Kamera depan dan lokasi GPS digunakan khusus saat verifikasi absensi.
+            Kamera depan dan lokasi GPS digunakan khusus saat perekaman dan verifikasi absensi.
           </p>
           <button
             type="button"
@@ -693,9 +939,32 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         </div>
       )}
 
+      {/* Self-service face enrollment prompt if employee hasn't recorded face yet */}
+      {!hasFaceReady && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 p-3.5 sm:p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="space-y-0.5">
+            <p className="text-sm font-bold text-amber-950">
+              Wajah Anda Belum Direkam
+            </p>
+            <p className="text-xs text-amber-900">
+              Rekam wajah langsung dari akun Anda (3 sampel otomatis) sebelum mulai absen.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={!isOnline || savingFace}
+            onClick={() => setSelfEnrollingFace(true)}
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#163A5C] min-h-[44px] whitespace-nowrap shrink-0"
+          >
+            <ScanFace className="w-4 h-4 shrink-0" />
+            <span>{savingFace ? 'Menyimpan...' : 'Rekam Wajah Sekarang'}</span>
+          </button>
+        </div>
+      )}
+
       {feedbackBanner && (
         <div
-          className={`rounded-xl border p-3.5 space-y-1 ${
+          className={`rounded-xl border p-3.5 space-y-2.5 ${
             feedbackBanner.kind === 'success'
               ? 'border-emerald-300 bg-emerald-50 text-emerald-950'
               : feedbackBanner.kind === 'warning'
@@ -703,10 +972,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               : 'border-red-300 bg-red-50 text-red-950'
           }`}
         >
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-bold min-w-0 break-words">
-              {feedbackBanner.title}
-            </p>
+          <div className="flex items-start justify-between gap-2">
+            <div className="space-y-0.5 min-w-0">
+              <p className="text-sm font-bold break-words">
+                {feedbackBanner.title}
+              </p>
+              <p className="text-xs sm:text-sm break-words">
+                {feedbackBanner.detail}
+              </p>
+            </div>
             <button
               type="button"
               onClick={() => setFeedbackBanner(null)}
@@ -715,7 +989,41 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               Tutup
             </button>
           </div>
-          <p className="text-xs sm:text-sm break-words">{feedbackBanner.detail}</p>
+
+          {feedbackBanner.appealAction && (
+            <button
+              type="button"
+              onClick={() => {
+                const act = feedbackBanner.appealAction!;
+                setFeedbackBanner(null);
+                openContextualAppeal(
+                  act.workDateWib,
+                  act.scope,
+                  act.category,
+                  act.contextHint
+                );
+              }}
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#163A5C] min-h-[42px]"
+            >
+              <FileText className="w-4 h-4 shrink-0" />
+              <span>{feedbackBanner.appealAction.label}</span>
+            </button>
+          )}
+
+          {feedbackBanner.enrollFaceAction && (
+            <button
+              type="button"
+              disabled={!isOnline || savingFace}
+              onClick={() => {
+                setFeedbackBanner(null);
+                setSelfEnrollingFace(true);
+              }}
+              className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-xl bg-[#0F2942] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#163A5C] min-h-[42px]"
+            >
+              <ScanFace className="w-4 h-4 shrink-0" />
+              <span>Rekam Wajah Sekarang</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -743,7 +1051,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         >
           <span>Sanggah</span>
           {pendingAppealsCount > 0 && (
-            <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-500 text-white font-mono">
+            <span className="px-1.5 py-0.5 text-[10px] rounded bg-amber-600 text-white font-mono tabular-nums">
               {pendingAppealsCount}
             </span>
           )}
@@ -785,7 +1093,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <button
                   type="button"
-                  disabled={submitting || gpsLoading || Boolean(todayCheckIn)}
+                  disabled={submitting || gpsLoading || hasApprovedCheckInToday}
                   onClick={() => initiateAttendance('CHECK_IN')}
                   className="w-full min-h-[56px] rounded-xl bg-[#0F2942] px-4 py-3.5 text-sm font-bold text-white hover:bg-[#163A5C] active:scale-[0.98] disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-center gap-2.5 transition-all"
                 >
@@ -793,7 +1101,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <span className="truncate">
                     {gpsLoading
                       ? 'Cek GPS...'
-                      : todayCheckIn
+                      : hasApprovedCheckInToday
                       ? 'SUDAH MASUK'
                       : 'ABSEN MASUK'}
                   </span>
@@ -804,110 +1112,196 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   disabled={
                     submitting ||
                     gpsLoading ||
-                    !todayCheckIn ||
-                    Boolean(todayCheckOut)
+                    !hasApprovedCheckInToday ||
+                    hasApprovedCheckOutToday
                   }
                   onClick={() => initiateAttendance('CHECK_OUT')}
                   className="w-full min-h-[56px] rounded-xl border-2 border-[#0F2942] bg-white px-4 py-3.5 text-sm font-bold text-[#0F2942] hover:bg-slate-50 active:scale-[0.98] disabled:opacity-45 disabled:cursor-not-allowed flex items-center justify-center gap-2.5 transition-all"
                 >
                   <LogOut className="w-5 h-5 shrink-0" />
                   <span className="truncate">
-                    {todayCheckOut ? 'SUDAH PULANG' : 'ABSEN PULANG'}
+                    {hasApprovedCheckOutToday ? 'SUDAH PULANG' : 'ABSEN PULANG'}
                   </span>
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 gap-3 text-xs">
-                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 min-w-0">
-                  <span className="text-slate-500 block">Masuk</span>
-                  <span className="font-mono font-bold text-sm text-slate-900 tabular-nums mt-0.5 block truncate">
-                    {todayCheckIn
-                      ? formatWibTimeOnly(
-                          todayCheckIn.serverTimestampIso ||
-                            todayCheckIn.deviceTimestampIso
+              {/* Synchronized Masuk & Pulang Status Boxes + Contextual 1-Tap Sanggah */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-col justify-between gap-2.5">
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-500 font-semibold">
+                        Absen Masuk
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded-md border text-[11px] font-bold ${
+                          todayEntry?.checkInStatusLabel.includes('Terlambat') ||
+                          todayEntry?.checkInStatusLabel.includes('Menunggu')
+                            ? 'border-amber-200 bg-amber-50 text-amber-800'
+                            : todayEntry?.checkInStatusLabel.includes('Sanggah Disetujui')
+                            ? 'border-sky-200 bg-sky-50 text-sky-900'
+                            : todayEntry?.checkInStatusLabel === 'Tepat Waktu'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                            : 'border-slate-200 bg-white text-slate-600'
+                        }`}
+                      >
+                        {todayEntry?.checkInStatusLabel || 'Belum Masuk'}
+                      </span>
+                    </div>
+                    <span className="font-mono font-bold text-base text-slate-900 tabular-nums mt-1.5 block">
+                      {todayEntry?.checkInTimeWib || '--:--'}
+                    </span>
+                  </div>
+
+                  {isTodayCheckInLate && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openContextualAppeal(
+                          todayWib,
+                          'CHECK_IN',
+                          'Kegiatan di Luar Kantor',
+                          `Sanggah Masuk Terlambat (${todayEntry?.checkInTimeWib}) karena ada kegiatan di luar kantor`
                         )
-                      : '--:--'}
-                  </span>
-                  <span className="text-[11px] text-slate-600 mt-0.5 block truncate">
-                    {!todayCheckIn
-                      ? 'Belum absen'
-                      : todayCheckIn.attendanceStatus === 'LATE'
-                      ? 'Terlambat'
-                      : todayCheckIn.attendanceStatus === 'NEEDS_REVIEW'
-                      ? 'Pending'
-                      : 'Valid'}
-                  </span>
+                      }
+                      className="w-full min-h-[38px] rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-amber-800 flex items-center justify-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5 shrink-0" />
+                      <span>Kegiatan Luar? Klik Sanggah</span>
+                    </button>
+                  )}
+
+                  {!hasApprovedCheckInToday && !hasActiveInAppealToday && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openContextualAppeal(
+                          todayWib,
+                          'CHECK_IN',
+                          'Kegiatan di Luar Kantor',
+                          `Sanggah Absen Masuk (${formatWibDateLong(todayWib)}) karena kegiatan di luar kantor`
+                        )
+                      }
+                      className="w-full min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-[#0F2942] hover:bg-slate-100 flex items-center justify-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5 shrink-0" />
+                      <span>Sanggah Masuk</span>
+                    </button>
+                  )}
                 </div>
 
-                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 min-w-0">
-                  <span className="text-slate-500 block">Pulang</span>
-                  <span className="font-mono font-bold text-sm text-slate-900 tabular-nums mt-0.5 block truncate">
-                    {todayCheckOut
-                      ? formatWibTimeOnly(
-                          todayCheckOut.serverTimestampIso ||
-                            todayCheckOut.deviceTimestampIso
+                <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-col justify-between gap-2.5">
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-500 font-semibold">
+                        Absen Pulang
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded-md border text-[11px] font-bold ${
+                          todayEntry?.checkOutStatusLabel.includes('Cepat') ||
+                          todayEntry?.checkOutStatusLabel.includes('Menunggu')
+                            ? 'border-amber-200 bg-amber-50 text-amber-800'
+                            : todayEntry?.checkOutStatusLabel.includes('Sanggah Disetujui')
+                            ? 'border-sky-200 bg-sky-50 text-sky-900'
+                            : todayEntry?.checkOutStatusLabel === 'Sudah Pulang'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                            : 'border-slate-200 bg-white text-slate-600'
+                        }`}
+                      >
+                        {todayEntry?.checkOutStatusLabel || 'Belum Pulang'}
+                      </span>
+                    </div>
+                    <span className="font-mono font-bold text-base text-slate-900 tabular-nums mt-1.5 block">
+                      {todayEntry?.checkOutTimeWib || '--:--'}
+                    </span>
+                  </div>
+
+                  {isTodayCheckOutEarly && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openContextualAppeal(
+                          todayWib,
+                          'CHECK_OUT',
+                          'Kegiatan di Luar Kantor',
+                          `Sanggah Pulang Cepat (${todayEntry?.checkOutTimeWib}) karena ada kegiatan di luar kantor`
                         )
-                      : '--:--'}
-                  </span>
-                  <span className="text-[11px] text-slate-600 mt-0.5 block truncate">
-                    {!todayCheckOut
-                      ? 'Belum absen'
-                      : todayCheckOut.attendanceStatus === 'NEEDS_REVIEW'
-                      ? 'Pending'
-                      : 'Valid'}
-                  </span>
+                      }
+                      className="w-full min-h-[38px] rounded-lg bg-amber-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-amber-800 flex items-center justify-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5 shrink-0" />
+                      <span>Pulang Cepat? Klik Sanggah</span>
+                    </button>
+                  )}
+
+                  {canAppealMissingCheckOutToday && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openContextualAppeal(
+                          todayWib,
+                          'CHECK_OUT',
+                          'Kegiatan di Luar Kantor',
+                          `Sanggah Tidak Bisa Absen Pulang di kantor (${formatWibDateLong(
+                            todayWib
+                          )}) karena kegiatan di luar`
+                        )
+                      }
+                      className="w-full min-h-[38px] rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-[#0F2942] hover:bg-slate-100 flex items-center justify-center gap-1.5"
+                    >
+                      <FileText className="w-3.5 h-3.5 shrink-0" />
+                      <span>Tidak Absen Pulang? Sanggah</span>
+                    </button>
+                  )}
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-2 pt-1 border-t border-slate-100 text-xs">
-                <div className="min-w-0">
-                  <span className="text-slate-500 block text-[11px]">Status</span>
-                  <div className="flex items-center gap-1 font-semibold text-slate-900 mt-0.5">
+              {/* Status & Self Face Enrollment Action Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 text-xs">
+                <div className="flex flex-wrap items-center gap-4">
+                  <div className="flex items-center gap-1.5 font-semibold text-slate-900">
                     {isOnline ? (
                       <>
                         <Wifi className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                        <span className="truncate">Online</span>
+                        <span>Online</span>
                       </>
                     ) : (
                       <>
                         <WifiOff className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-                        <span className="truncate">Offline</span>
+                        <span>Offline</span>
                       </>
                     )}
                   </div>
-                </div>
 
-                <div className="min-w-0">
-                  <span className="text-slate-500 block text-[11px]">Wajah</span>
-                  <div className="flex items-center gap-1 font-semibold text-slate-900 mt-0.5">
-                    <ScanFace
-                      className={`w-3.5 h-3.5 shrink-0 ${
-                        user.hasFaceProfile || localFaceVector
-                          ? 'text-emerald-600'
-                          : 'text-red-600'
-                      }`}
-                    />
-                    <span className="truncate">
-                      {user.hasFaceProfile || localFaceVector ? 'Aktif' : 'Belum'}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="min-w-0">
-                  <span className="text-slate-500 block text-[11px]">Jam Kerja</span>
-                  <div className="flex items-center gap-1 font-mono font-semibold text-slate-900 tabular-nums mt-0.5">
+                  <div className="flex items-center gap-1.5 font-mono font-semibold text-slate-900 tabular-nums">
                     <Clock className="w-3.5 h-3.5 text-[#0F2942] shrink-0" />
-                    <span className="truncate">
+                    <span>
                       {settings
-                        ? `${settings.workStartTime}–${settings.workEndTime}`
+                        ? `${settings.workStartTime}–${settings.workEndTime} WIB`
                         : '--:--'}
                     </span>
                   </div>
                 </div>
+
+                <button
+                  type="button"
+                  disabled={!isOnline || savingFace}
+                  onClick={() => setSelfEnrollingFace(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-[#0F2942] hover:bg-slate-50 active:scale-[0.98] disabled:opacity-50 min-h-[40px] whitespace-nowrap"
+                >
+                  <Camera className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {savingFace
+                      ? 'Menyimpan...'
+                      : hasFaceReady
+                      ? 'Rekam Ulang Wajah'
+                      : 'Rekam Wajah'}
+                  </span>
+                </button>
               </div>
             </div>
 
-            {/* GPS & Sanggah Shortcut Card */}
+            {/* GPS & Full-Day Field Duty Card */}
             <div className="lg:col-span-5 rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 flex flex-col justify-between space-y-4">
               <div className="space-y-3">
                 <div className="flex items-center justify-between gap-2">
@@ -921,7 +1315,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                     type="button"
                     disabled={gpsLoading}
                     onClick={refreshGps}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-[#0F2942] hover:bg-slate-50 active:scale-[0.98] min-h-[44px] shrink-0"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-[#0F2942] hover:bg-slate-50 active:scale-[0.98] min-h-[44px] shrink-0 whitespace-nowrap"
                   >
                     <RefreshCw
                       className={`w-3.5 h-3.5 ${gpsLoading ? 'animate-spin' : ''}`}
@@ -944,7 +1338,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                     </div>
                     <div className="flex items-center justify-between gap-2 py-1.5 border-b border-slate-100">
                       <span className="text-slate-500 font-sans shrink-0">
-                        Jarak
+                        Jarak ke Kantor
                       </span>
                       <span
                         className={`text-right font-semibold ${
@@ -956,7 +1350,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                     </div>
                     <div className="flex items-center justify-between gap-2 py-1.5">
                       <span className="text-slate-500 font-sans shrink-0">
-                        Akurasi
+                        Akurasi Sinyal
                       </span>
                       <span
                         className={`text-right font-semibold ${
@@ -974,11 +1368,18 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
               <button
                 type="button"
-                onClick={() => setActiveTab('SANGGAH')}
+                onClick={() =>
+                  openContextualAppeal(
+                    todayWib,
+                    'FULL_DAY',
+                    'Tugas Lapangan',
+                    `Sanggah Tugas Lapangan Sehari Penuh (${formatWibDateLong(todayWib)})`
+                  )
+                }
                 className="w-full min-h-[46px] rounded-xl border border-slate-300 bg-slate-50 px-3.5 py-2.5 text-xs font-bold text-[#0F2942] hover:bg-slate-100 active:scale-[0.98] flex items-center justify-center gap-2 transition-all"
               >
                 <FileText className="w-4 h-4 shrink-0" />
-                <span>Tugas Lapangan? Ajukan Sanggah Absen</span>
+                <span>Tugas Lapangan Sehari? Ajukan Sanggah</span>
               </button>
             </div>
           </div>
@@ -995,7 +1396,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                       type="button"
                       disabled={syncingNow}
                       onClick={syncPendingRecords}
-                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#0F2942] px-3.5 py-2 text-xs font-semibold text-white min-h-[40px]"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#0F2942] px-3.5 py-2 text-xs font-semibold text-white min-h-[40px] whitespace-nowrap"
                     >
                       <RefreshCw
                         className={`w-3.5 h-3.5 ${syncingNow ? 'animate-spin' : ''}`}
@@ -1014,7 +1415,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                       <span className="font-semibold text-slate-900 block">
                         {item.type === 'CHECK_IN' ? 'Absen Masuk' : 'Absen Pulang'}
                       </span>
-                      <span className="font-mono text-[11px] text-slate-500">
+                      <span className="font-mono text-[11px] text-slate-500 tabular-nums">
                         {formatWibDateTime(item.deviceTimestampIso)}
                       </span>
                     </div>
@@ -1049,10 +1450,23 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               </h2>
             </div>
 
+            {appealContextHint && (
+              <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-950 flex items-start justify-between gap-2">
+                <span>{appealContextHint}</span>
+                <button
+                  type="button"
+                  onClick={() => setAppealContextHint(null)}
+                  className="font-semibold underline shrink-0"
+                >
+                  Tutup
+                </button>
+              </div>
+            )}
+
             <div className="space-y-3 text-xs">
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Tanggal
+                  Tanggal Kerja
                 </label>
                 <input
                   type="date"
@@ -1065,14 +1479,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Jenis Absensi
+                  Jenis Sanggah Absensi
                 </label>
                 <div className="grid grid-cols-3 gap-1.5">
                   {(
                     [
-                      ['FULL_DAY', 'Masuk & Pulang'],
-                      ['CHECK_IN', 'Masuk'],
-                      ['CHECK_OUT', 'Pulang'],
+                      ['CHECK_IN', 'Masuk / Telat'],
+                      ['CHECK_OUT', 'Pulang / Cepat'],
+                      ['FULL_DAY', 'Sehari Penuh'],
                     ] as [AppealScope, string][]
                   ).map(([val, label]) => (
                     <button
@@ -1093,7 +1507,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Alasan
+                  Kategori Kegiatan
                 </label>
                 <select
                   value={appealCategory}
@@ -1110,22 +1524,23 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Keterangan
+                  Keterangan Kegiatan / Lokasi Luar
                 </label>
                 <textarea
+                  ref={reasonTextareaRef}
                   required
                   minLength={3}
                   rows={3}
                   value={appealReason}
                   onChange={(e) => setAppealReason(e.target.value)}
-                  placeholder="Lokasi / keperluan tugas..."
+                  placeholder="Contoh: Kunjungan klien di Bekasi pagi hari / Lanjut tugas lapangan sore..."
                   className="w-full rounded-xl border border-slate-300 p-3 text-base sm:text-sm focus:outline-none focus:border-[#0F2942]"
                 />
               </div>
 
               {gpsReading && (
-                <p className="text-[11px] font-mono text-slate-500">
-                  Lokasi saat ini: {gpsReading.latitude.toFixed(5)},{' '}
+                <p className="text-[11px] font-mono text-slate-500 tabular-nums">
+                  Koordinat saat ini: {gpsReading.latitude.toFixed(5)},{' '}
                   {gpsReading.longitude.toFixed(5)}
                 </p>
               )}
@@ -1143,7 +1558,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
           <div className="lg:col-span-7 rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
             <h2 className="text-base font-bold text-slate-900">
-              Status Sanggah ({appeals.length})
+              Riwayat Sanggah &amp; Status Sinkron ({appeals.length})
             </h2>
 
             {appeals.length === 0 ? (
@@ -1156,33 +1571,33 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <div key={apl.appealId} className="py-3.5 space-y-1.5 text-xs">
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <span className="font-bold text-slate-900">
+                        <span className="font-bold text-slate-900 block">
                           {apl.category} · {formatScopeLabel(apl.scope)}
                         </span>
-                        <span className="block font-mono text-[11px] text-slate-500">
-                          Tanggal: {apl.workDateWib}
+                        <span className="font-mono text-[11px] text-slate-600 tabular-nums">
+                          {formatWibDateLong(apl.workDateWib)} ({apl.workDateWib})
                         </span>
                       </div>
                       <span
-                        className={`font-bold shrink-0 ${
+                        className={`px-2 py-0.5 rounded-md border text-[11px] font-bold shrink-0 ${
                           apl.status === 'APPROVED'
-                            ? 'text-emerald-700'
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
                             : apl.status === 'REJECTED'
-                            ? 'text-red-700'
-                            : 'text-amber-700'
+                            ? 'border-red-200 bg-red-50 text-red-800'
+                            : 'border-amber-200 bg-amber-50 text-amber-800'
                         }`}
                       >
                         {apl.status === 'APPROVED'
-                          ? 'Disetujui'
+                          ? 'Disetujui · Hadir'
                           : apl.status === 'REJECTED'
                           ? 'Ditolak'
-                          : 'Menunggu'}
+                          : 'Menunggu Admin'}
                       </span>
                     </div>
                     <p className="text-slate-700 break-words">{apl.reason}</p>
                     {apl.reviewNote && (
-                      <p className="text-[11px] text-slate-500 break-words">
-                        Admin: {apl.reviewNote}
+                      <p className="text-[11px] text-slate-600 break-words">
+                        Catatan Admin: {apl.reviewNote}
                       </p>
                     )}
                   </div>
@@ -1193,29 +1608,34 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         </div>
       )}
 
-      {/* TAB 3: RIWAYAT */}
+      {/* TAB 3: RIWAYAT (Paired Daily View + Contextual Sanggah Buttons) */}
       {activeTab === 'RIWAYAT' && (
         <div className="rounded-2xl bg-white border border-slate-200 p-4 sm:p-6 space-y-4">
           <div className="flex items-center justify-between gap-2">
-            <h2 className="text-base font-bold text-slate-900">
-              Riwayat Absensi
-            </h2>
-            <div className="flex items-center gap-2">
+            <div>
+              <h2 className="text-base font-bold text-slate-900">
+                Riwayat Kehadiran Harian
+              </h2>
+              <p className="text-xs text-slate-500">
+                Tersinkron otomatis antara Absen Kamera &amp; Sanggah Absen
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={handleExportPending}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px]"
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px] whitespace-nowrap"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Ekspor</span>
+                <span>Backup Lokal</span>
               </button>
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px]"
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[38px] whitespace-nowrap"
               >
                 <Upload className="w-3.5 h-3.5" />
-                <span>Impor</span>
+                <span>Pulihkan</span>
               </button>
               <input
                 ref={fileInputRef}
@@ -1227,115 +1647,163 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
             </div>
           </div>
 
-          {history.length === 0 ? (
+          {dailyEntries.length === 0 ? (
             <p className="text-sm text-slate-500 py-8 text-center border border-dashed border-slate-200 rounded-xl">
               Belum ada riwayat absensi.
             </p>
           ) : (
-            <>
-              <div className="md:hidden divide-y divide-slate-100">
-                {history.map((rec) => (
-                  <div key={rec.transactionId} className="py-3 space-y-1 text-xs">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-bold text-slate-900">
-                        {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'} ·{' '}
-                        <span className="font-mono font-normal text-slate-600">
-                          {rec.workDateWib}
-                        </span>
-                      </span>
-                      <span className="font-semibold shrink-0">
-                        {rec.attendanceStatus === 'VALID' && (
-                          <span className="inline-flex items-center gap-1 text-emerald-700">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            <span>Valid</span>
-                          </span>
-                        )}
-                        {rec.attendanceStatus === 'LATE' && (
-                          <span className="text-amber-700">Terlambat</span>
-                        )}
-                        {rec.attendanceStatus === 'NEEDS_REVIEW' && (
-                          <span className="inline-flex items-center gap-1 text-amber-700">
-                            <AlertTriangle className="w-3.5 h-3.5" />
-                            <span>Pending</span>
-                          </span>
-                        )}
-                        {rec.attendanceStatus === 'REJECTED' && (
-                          <span className="text-red-700">Ditolak</span>
-                        )}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-slate-500 tabular-nums">
-                      <span>
-                        {formatWibDateTime(
-                          rec.serverTimestampIso || rec.deviceTimestampIso
-                        )}
-                      </span>
-                      <span>
-                        {rec.livenessDetail.startsWith('Sanggah')
-                          ? 'Sanggah Disetujui'
-                          : `${rec.distanceToOfficeMeters}m`}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
+            <div className="divide-y divide-slate-200">
+              {dailyEntries.map((entry) => {
+                const hasPendingOrApprovedIn = appeals.some(
+                  (a) =>
+                    a.workDateWib === entry.workDateWib &&
+                    (a.scope === 'CHECK_IN' || a.scope === 'FULL_DAY') &&
+                    (a.status === 'PENDING' || a.status === 'APPROVED')
+                );
+                const hasPendingOrApprovedOut = appeals.some(
+                  (a) =>
+                    a.workDateWib === entry.workDateWib &&
+                    (a.scope === 'CHECK_OUT' || a.scope === 'FULL_DAY') &&
+                    (a.status === 'PENDING' || a.status === 'APPROVED')
+                );
 
-              <div className="hidden md:block overflow-x-auto">
-                <table className="w-full text-left text-xs sm:text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-200 text-xs text-slate-500">
-                      <th className="py-2.5 pr-4 font-semibold">Tanggal</th>
-                      <th className="py-2.5 pr-4 font-semibold">Jenis</th>
-                      <th className="py-2.5 pr-4 font-semibold">Waktu WIB</th>
-                      <th className="py-2.5 pr-4 font-semibold">Keterangan</th>
-                      <th className="py-2.5 font-semibold">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {history.map((rec) => (
-                      <tr key={rec.transactionId} className="hover:bg-slate-50/70">
-                        <td className="py-3 pr-4 font-mono text-xs text-slate-800 tabular-nums">
-                          {rec.workDateWib}
-                        </td>
-                        <td className="py-3 pr-4 font-semibold text-slate-900">
-                          {rec.type === 'CHECK_IN' ? 'Masuk' : 'Pulang'}
-                        </td>
-                        <td className="py-3 pr-4 font-mono text-xs text-slate-700 tabular-nums">
-                          {formatWibDateTime(
-                            rec.serverTimestampIso || rec.deviceTimestampIso
-                          )}
-                        </td>
-                        <td className="py-3 pr-4 text-xs text-slate-600">
-                          {rec.livenessDetail.startsWith('Sanggah')
-                            ? rec.livenessDetail
-                            : `${rec.distanceToOfficeMeters}m · ${(
-                                rec.faceMatchScore * 100
-                              ).toFixed(0)}%`}
-                        </td>
-                        <td className="py-3 text-xs font-semibold">
-                          {rec.attendanceStatus === 'VALID' && (
-                            <span className="text-emerald-700">Valid</span>
-                          )}
-                          {rec.attendanceStatus === 'LATE' && (
-                            <span className="text-amber-700">Terlambat</span>
-                          )}
-                          {rec.attendanceStatus === 'NEEDS_REVIEW' && (
-                            <span className="text-amber-700">Pending</span>
-                          )}
-                          {rec.attendanceStatus === 'REJECTED' && (
-                            <span className="text-red-700">Ditolak</span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+                const showAppealLateBtn =
+                  entry.checkInRecord?.attendanceStatus === 'LATE' &&
+                  !hasPendingOrApprovedIn;
+
+                const showAppealOutBtn =
+                  !hasPendingOrApprovedOut &&
+                  (entry.checkOutRecord?.attendanceStatus === 'EARLY_LEAVE' ||
+                    (entry.checkInTimeWib !== '-' &&
+                      entry.checkOutStatusLabel === 'Belum Pulang'));
+
+                return (
+                  <div
+                    key={entry.key}
+                    className="py-4 space-y-3 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="font-bold text-sm text-slate-900 block">
+                          {formatWibDateLong(entry.workDateWib)}
+                        </span>
+                        <span className="font-mono text-[11px] text-slate-500 tabular-nums">
+                          {entry.workDateWib} · Sumber: {entry.sourceLabel}
+                          {entry.durationLabel !== '-'
+                            ? ` · Durasi: ${entry.durationLabel}`
+                            : ''}
+                        </span>
+                      </div>
+                      <span
+                        className={`px-2.5 py-1 rounded-md border text-xs font-bold ${getDailyBadgeClasses(
+                          entry.overallStatus
+                        )}`}
+                      >
+                        {entry.overallLabel}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                        <span className="text-[11px] text-slate-500 block">
+                          Jam Masuk
+                        </span>
+                        <span className="font-mono font-bold text-sm text-slate-900 tabular-nums mt-0.5 block">
+                          {entry.checkInTimeWib}
+                        </span>
+                        <span className="text-[11px] font-semibold text-slate-700 mt-0.5 block">
+                          {entry.checkInStatusLabel}
+                        </span>
+                      </div>
+
+                      <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                        <span className="text-[11px] text-slate-500 block">
+                          Jam Pulang
+                        </span>
+                        <span className="font-mono font-bold text-sm text-slate-900 tabular-nums mt-0.5 block">
+                          {entry.checkOutTimeWib}
+                        </span>
+                        <span className="text-[11px] font-semibold text-slate-700 mt-0.5 block">
+                          {entry.checkOutStatusLabel}
+                        </span>
+                      </div>
+                    </div>
+
+                    {entry.notes !== '-' && (
+                      <p className="text-slate-700 bg-slate-50 border border-slate-200/80 rounded-lg px-3 py-2 break-words">
+                        {entry.notes}
+                      </p>
+                    )}
+
+                    {(showAppealLateBtn || showAppealOutBtn) && (
+                      <div className="flex flex-wrap gap-2 pt-0.5">
+                        {showAppealLateBtn && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openContextualAppeal(
+                                entry.workDateWib,
+                                'CHECK_IN',
+                                'Kegiatan di Luar Kantor',
+                                `Sanggah Masuk Terlambat pada ${formatWibDateLong(
+                                  entry.workDateWib
+                                )}`
+                              )
+                            }
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900 hover:bg-amber-100 min-h-[38px]"
+                          >
+                            <FileText className="w-3.5 h-3.5 shrink-0" />
+                            <span>Klik Sanggah Terlambat</span>
+                          </button>
+                        )}
+                        {showAppealOutBtn && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openContextualAppeal(
+                                entry.workDateWib,
+                                'CHECK_OUT',
+                                'Kegiatan di Luar Kantor',
+                                `Sanggah ${
+                                  entry.checkOutRecord?.attendanceStatus ===
+                                  'EARLY_LEAVE'
+                                    ? 'Pulang Cepat'
+                                    : 'Tidak Absen Pulang'
+                                } pada ${formatWibDateLong(entry.workDateWib)}`
+                              )
+                            }
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-900 hover:bg-amber-100 min-h-[38px]"
+                          >
+                            <FileText className="w-3.5 h-3.5 shrink-0" />
+                            <span>
+                              {entry.checkOutRecord?.attendanceStatus ===
+                              'EARLY_LEAVE'
+                                ? 'Klik Sanggah Pulang Cepat'
+                                : 'Klik Sanggah Pulang'}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       )}
 
+      {/* Self-service Face Enrollment Modal */}
+      {selfEnrollingFace && (
+        <FaceCameraModal
+          mode="ENROLL"
+          employeeName={`${user.fullName} (${user.employeeId})`}
+          onSuccess={handleSelfFaceEnrollSuccess}
+          onCancel={() => setSelfEnrollingFace(false)}
+        />
+      )}
+
+      {/* Attendance Verification Modal */}
       {activeAttendanceType && settings && (
         <FaceCameraModal
           mode="VERIFY"

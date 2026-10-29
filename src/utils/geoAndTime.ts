@@ -45,28 +45,84 @@ export function cosineSimilarity(vecA: number[], vecB: number[]): number {
 export function formatWibDateTime(isoOrDate: string | Date): string {
   const d = typeof isoOrDate === 'string' ? new Date(isoOrDate) : isoOrDate;
   if (Number.isNaN(d.getTime())) return '-';
-  return new Intl.DateTimeFormat('id-ID', {
+  const datePart = new Intl.DateTimeFormat('id-ID', {
     timeZone: 'Asia/Jakarta',
     day: '2-digit',
     month: 'short',
     year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).format(d) + ' WIB';
+  }).format(d);
+  const timePart = formatWibHourMinute(d, true);
+  return `${datePart}, ${timePart}`;
 }
 
 export function formatWibTimeOnly(isoOrDate: string | Date): string {
+  return formatWibHourMinute(isoOrDate, false);
+}
+
+export function formatWibHourMinute(
+  isoOrDate?: string | Date,
+  withSeconds: boolean = false
+): string {
+  if (!isoOrDate) return '--:--';
   const d = typeof isoOrDate === 'string' ? new Date(isoOrDate) : isoOrDate;
   if (Number.isNaN(d.getTime())) return '--:--';
-  return new Intl.DateTimeFormat('id-ID', {
+  const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Jakarta',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit',
+    second: withSeconds ? '2-digit' : undefined,
     hour12: false,
-  }).format(d) + ' WIB';
+  }).formatToParts(d);
+  const map: Record<string, string> = {};
+  for (const p of parts) {
+    if (p.type !== 'literal') map[p.type] = p.value;
+  }
+  const hh = map.hour === '24' ? '00' : map.hour || '00';
+  const mm = map.minute || '00';
+  if (withSeconds) {
+    const ss = map.second || '00';
+    return `${hh}:${mm}:${ss} WIB`;
+  }
+  return `${hh}:${mm} WIB`;
+}
+
+export function formatWibDateLong(yyyyMmDd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(yyyyMmDd)) return yyyyMmDd || '-';
+  const d = new Date(`${yyyyMmDd}T12:00:00+07:00`);
+  if (Number.isNaN(d.getTime())) return yyyyMmDd;
+  return new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    weekday: 'long',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  }).format(d);
+}
+
+export function buildScheduledWibIso(workDateWib: string, hhmm: string): string {
+  const cleanDate = /^\d{4}-\d{2}-\d{2}$/.test(workDateWib)
+    ? workDateWib
+    : getWibParts(new Date()).dateStr;
+  const cleanTime = /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : '08:00';
+  const d = new Date(`${cleanDate}T${cleanTime}:00+07:00`);
+  if (Number.isNaN(d.getTime())) return new Date().toISOString();
+  return d.toISOString();
+}
+
+export function formatDurationBetween(
+  checkInIso?: string,
+  checkOutIso?: string
+): string {
+  if (!checkInIso || !checkOutIso) return '-';
+  const t1 = new Date(checkInIso).getTime();
+  const t2 = new Date(checkOutIso).getTime();
+  if (Number.isNaN(t1) || Number.isNaN(t2) || t2 <= t1) return '-';
+  const diffMins = Math.round((t2 - t1) / 60000);
+  if (diffMins <= 0 || diffMins > 24 * 60) return '-';
+  const hours = Math.floor(diffMins / 60);
+  const mins = diffMins % 60;
+  if (hours === 0) return `${mins}m`;
+  return `${hours}j ${String(mins).padStart(2, '0')}m`;
 }
 
 export function getWibParts(date: Date = new Date()): {

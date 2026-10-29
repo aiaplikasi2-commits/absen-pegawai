@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import http from 'http';
 import express, { Request, Response, NextFunction } from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -176,9 +175,58 @@ function requireAdmin(
 // IP brute-force guard in addition to per-username lockout
 const ipAttempts = new Map<string, { count: number; lockedUntil: number }>();
 
-async function startServer() {
+export function createApiApp(): express.Express {
   const app = express();
+
+  // Enable CORS when frontend is hosted on a separate domain (e.g. Netlify + Cloud Run API)
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    );
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  // Normalize Netlify Functions invocation path (/.netlify/functions/api/* -> /api/*)
+  app.use((req, _res, next) => {
+    if (req.url.startsWith('/.netlify/functions/api')) {
+      const suffix = req.url.slice('/.netlify/functions/api'.length);
+      req.url = `/api${suffix.startsWith('/') ? suffix : suffix ? `/${suffix}` : ''}`;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '2mb' }));
+
+  // Ensure Buffer/string JSON payloads in serverless environments are parsed
+  app.use((req, _res, next) => {
+    if (Buffer.isBuffer(req.body)) {
+      try {
+        req.body = JSON.parse(req.body.toString('utf-8'));
+      } catch {
+        // ignore non-JSON buffer
+      }
+    } else if (typeof req.body === 'string' && req.body.trim().startsWith('{')) {
+      try {
+        req.body = JSON.parse(req.body);
+      } catch {
+        // ignore invalid JSON string
+      }
+    }
+    next();
+  });
 
   // 1. Server time endpoint (prevents client clock spoofing)
   app.get('/api/time', async (_req, res) => {
@@ -2217,10 +2265,20 @@ async function startServer() {
     }
   );
 
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Endpoint API tidak ditemukan.' });
+  });
+
+  return app;
+}
+
+async function startServer() {
+  const app = createApiApp();
   const httpServer = http.createServer(app);
 
   // Vite middleware for dev OR static dist serving for production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
@@ -2243,4 +2301,12 @@ async function startServer() {
   });
 }
 
-startServer();
+const isServerlessRuntime = Boolean(
+  process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT
+);
+
+if (!isServerlessRuntime) {
+  startServer();
+}

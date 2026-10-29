@@ -35,6 +35,7 @@ import {
 } from '../lib/firebase';
 import { downloadAndroidSourceZip } from '../utils/androidProjectBundle';
 import { FaceCameraModal, BiometricCaptureResult } from './FaceCameraModal';
+import { apiFetch } from '../utils/apiFetchBridge';
 
 export type AdminSection =
   | 'OVERVIEW'
@@ -148,7 +149,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       const qs = new URLSearchParams();
       if (dateFilter) qs.set('date', dateFilter);
       if (searchQuery) qs.set('search', searchQuery);
-      const resp = await fetch(`/api/admin/attendance?${qs.toString()}`, {
+      const resp = await apiFetch(`/api/admin/attendance?${qs.toString()}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (resp.ok) {
@@ -166,7 +167,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [dateFilter, searchQuery, token]);
 
   const fetchAppeals = useCallback(async () => {
-    const resp = await fetch('/api/admin/appeals', {
+    const resp = await apiFetch('/api/admin/appeals', {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (resp.ok) {
@@ -176,7 +177,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [token]);
 
   const fetchEmployees = useCallback(async () => {
-    const resp = await fetch('/api/admin/employees', {
+    const resp = await apiFetch('/api/admin/employees', {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (resp.ok) {
@@ -195,7 +196,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [token]);
 
   const fetchAuditLogs = useCallback(async () => {
-    const resp = await fetch('/api/admin/audit-logs', {
+    const resp = await apiFetch('/api/admin/audit-logs', {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (resp.ok) {
@@ -205,7 +206,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [token]);
 
   const fetchMonthlyReport = useCallback(async () => {
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/monthly-report?period=${encodeURIComponent(reportPeriod)}`,
       {
         headers: { Authorization: `Bearer ${token}` },
@@ -253,7 +254,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setCreatingEmp(true);
     setBanner(null);
     try {
-      const resp = await fetch('/api/admin/employees', {
+      const resp = await apiFetch('/api/admin/employees', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -295,7 +296,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setEnrollingEmployee(null);
     if (!target) return;
 
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/employees/${encodeURIComponent(target.employeeId)}/face-profile`,
       {
         method: 'POST',
@@ -326,7 +327,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const handleToggleEmployeeActive = async (emp: EmployeeProfile) => {
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/employees/${encodeURIComponent(emp.employeeId)}`,
       {
         method: 'PATCH',
@@ -349,7 +350,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleConfirmResetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!resetTargetEmp) return;
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/employees/${encodeURIComponent(resetTargetEmp.employeeId)}`,
       {
         method: 'PATCH',
@@ -375,7 +376,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleConfirmDeleteBiometrics = async () => {
     if (!deleteBioTarget) return;
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/employees/${encodeURIComponent(deleteBioTarget.employeeId)}/biometrics`,
       {
         method: 'DELETE',
@@ -398,7 +399,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleConfirmDeleteEmployee = async () => {
     if (!deleteEmpTarget) return;
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/employees/${encodeURIComponent(deleteEmpTarget.employeeId)}`,
       {
         method: 'DELETE',
@@ -421,7 +422,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (!appealReviewModal) return;
     setProcessingAppeal(true);
     try {
-      const resp = await fetch(
+      const resp = await apiFetch(
         `/api/admin/appeals/${encodeURIComponent(
           appealReviewModal.appeal.appealId
         )}/review`,
@@ -461,7 +462,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const openEvidenceModal = async (rec: AttendanceRecord) => {
     setEvidenceModal({ record: rec, loading: true });
     try {
-      const resp = await fetch(
+      const resp = await apiFetch(
         `/api/admin/attendance/${encodeURIComponent(rec.transactionId)}/evidence`,
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -485,7 +486,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleSubmitReviewDecision = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!reviewModal) return;
-    const resp = await fetch(
+    const resp = await apiFetch(
       `/api/admin/attendance/${encodeURIComponent(
         reviewModal.record.transactionId
       )}/review`,
@@ -594,7 +595,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (!settingsForm) return;
     setSavingSettings(true);
     try {
-      const resp = await fetch('/api/admin/office-settings', {
+      const resp = await apiFetch('/api/admin/office-settings', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -627,7 +628,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   };
 
   const handleDownloadCloudBackup = async () => {
-    const resp = await fetch('/api/admin/backup/export', {
+    const resp = await apiFetch('/api/admin/backup/export', {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (resp.ok) {
@@ -654,7 +655,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     if (!file) return;
     try {
       const parsed = JSON.parse(await file.text());
-      const resp = await fetch('/api/admin/backup/restore', {
+      const resp = await apiFetch('/api/admin/backup/restore', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -689,7 +690,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const handleChangeAdminPassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    const resp = await fetch('/api/auth/change-password', {
+    const resp = await apiFetch('/api/auth/change-password', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -743,7 +744,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         setGmailConnectedEmail(connected.user.email || 'Terhubung');
       }
 
-      const resp = await fetch('/api/admin/monthly-report/send-email', {
+      const resp = await apiFetch('/api/admin/monthly-report/send-email', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

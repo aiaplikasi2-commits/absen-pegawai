@@ -46,6 +46,7 @@ import {
   updateLocalPendingStatus,
 } from '../services/offlineStore';
 import { FaceCameraModal, BiometricCaptureResult } from './FaceCameraModal';
+import { apiFetch } from '../utils/apiFetchBridge';
 
 interface EmployeeDashboardProps {
   user: AuthSessionUser;
@@ -138,10 +139,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     if (isOnline) {
       try {
         const [histResp, aplResp] = await Promise.all([
-          fetch('/api/attendance/my-history', {
+          apiFetch('/api/attendance/my-history', {
             headers: { Authorization: `Bearer ${token}` },
           }),
-          fetch('/api/appeals/my', {
+          apiFetch('/api/appeals/my', {
             headers: { Authorization: `Bearer ${token}` },
           }),
         ]);
@@ -204,7 +205,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         setPendingLocal(await getAllLocalPendingAttendance(user.employeeId));
 
         try {
-          const resp = await fetch('/api/attendance/submit', {
+          const resp = await apiFetch('/api/attendance/submit', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -293,7 +294,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const handleAcceptConsent = async () => {
     setConsentSubmitting(true);
     try {
-      const resp = await fetch('/api/employee/consent', {
+      const resp = await apiFetch('/api/employee/consent', {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -460,7 +461,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     }
 
     try {
-      const resp = await fetch('/api/attendance/submit', {
+      const resp = await apiFetch('/api/attendance/submit', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -542,7 +543,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         body.longitude = gpsReading.longitude;
       }
 
-      const resp = await fetch('/api/appeals', {
+      const resp = await apiFetch('/api/appeals', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

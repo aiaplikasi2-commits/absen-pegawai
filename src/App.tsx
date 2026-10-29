@@ -23,6 +23,7 @@ import {
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { EmployeeDashboard } from './components/EmployeeDashboard';
 import { AdminDashboard, AdminSection } from './components/AdminDashboard';
+import { apiFetch } from './utils/apiFetchBridge';
 
 const SESSION_TOKEN_KEY = 'absensi_session_jwt';
 const SESSION_USER_CACHE_KEY = 'absensi_session_user_cache';
@@ -71,7 +72,7 @@ export default function App() {
   const hydrateSessionFromServer = useCallback(async (activeToken: string) => {
     if (!navigator.onLine) return;
     try {
-      const resp = await fetch('/api/auth/me', {
+      const resp = await apiFetch('/api/auth/me', {
         headers: { Authorization: `Bearer ${activeToken}` },
       });
       if (!resp.ok) {
@@ -117,7 +118,7 @@ export default function App() {
     setLoginLoading(true);
     setLoginError(null);
     try {
-      const resp = await fetch('/api/auth/login', {
+      const resp = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -149,7 +150,7 @@ export default function App() {
     setLoginError(null);
     try {
       const googleRes = await connectGoogleForGmail();
-      const resp = await fetch('/api/auth/google-admin', {
+      const resp = await apiFetch('/api/auth/google-admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ idToken: googleRes.idToken }),

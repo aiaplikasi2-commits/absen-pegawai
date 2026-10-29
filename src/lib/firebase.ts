@@ -61,6 +61,28 @@ export async function connectGoogleForGmail(): Promise<{
       idToken,
       gmailAccessToken: cachedGmailAccessToken,
     };
+  } catch (err: any) {
+    const code = String(err?.code || '');
+    const rawMsg = String(err?.message || '');
+    if (
+      code === 'auth/unauthorized-domain' ||
+      rawMsg.includes('auth/unauthorized-domain')
+    ) {
+      const host =
+        typeof window !== 'undefined' ? window.location.hostname : 'domain ini';
+      throw new Error(
+        `Domain "${host}" belum diizinkan di Firebase Auth. Tambahkan "${host}" di Firebase Console (Project: ${firebaseConfig.projectId} → Authentication → Settings → Authorized domains), atau login menggunakan Username & Password.`
+      );
+    }
+    if (code === 'auth/popup-closed-by-user') {
+      throw new Error('Jendela login Google ditutup sebelum selesai.');
+    }
+    if (code === 'auth/popup-blocked') {
+      throw new Error(
+        'Popup login Google diblokir browser. Izinkan popup lalu coba lagi.'
+      );
+    }
+    throw err;
   } finally {
     isSigningIn = false;
   }
